@@ -9,7 +9,7 @@ from core.bot_management.grid_trading_bot import GridTradingBot
 from core.bot_management.event_bus import EventBus
 from core.bot_management.notification.notification_handler import NotificationHandler
 from config.config_validator import ConfigValidator
-from adapter.config_adapter import DictConfigManager  # Make sure you created this file!
+from adapter.config_adapter import DictConfigManager
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -69,7 +69,7 @@ def create_config(exchange, pair, api_key, api_secret, mode, strategy_settings, 
         "trading_settings": trading_settings,
         "grid_strategy": {
             "type": "simple_grid",
-            "spacing": "geometric", # or strategy_settings.get('spacing', 'geometric')
+            "spacing": strategy_settings.get('spacing', 'geometric'),
             "num_grids": strategy_settings['grids'],
             "range": {
                 "top": strategy_settings['upper_price'],
@@ -122,7 +122,7 @@ async def start_bot(req: BotRequest):
         validator = ConfigValidator()
         config_manager = DictConfigManager(config_dict, validator)
         event_bus = EventBus()
-        # Live bots might need notifications, passed as None for now
+        # Live bots might need notifications, passed as None for now (can be expanded later)
         notification_handler = NotificationHandler(event_bus, None, config_manager.get_trading_mode())
 
         bot = GridTradingBot(
@@ -185,7 +185,7 @@ async def run_backtest(req: BacktestRequest):
                 "start_date": req.startDate,
                 "end_date": req.endDate
             },
-            # historical_data_file must be None to force fetching from Exchange
+            # historical_data_file must be None to force fetching from Exchange via CCXT
             "historical_data_file": None 
         }
 
@@ -196,7 +196,8 @@ async def run_backtest(req: BacktestRequest):
             "spacing": "geometric"
         }
 
-        # API keys are needed even for backtest to fetch OHLCV data
+        # API keys are passed as dummy values since backtesting primarily needs public data,
+        # but the bot structure requires them to be present.
         config_dict = create_config(
             req.exchange, req.pair, "dummy_key", "dummy_secret", 
             "backtest", strategy_settings, trading_settings
