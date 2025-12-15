@@ -1,9 +1,3 @@
-Here is a complete, professional `README.md` file tailored for your **Fydblock** project. It highlights the advanced features we just implemented (Database Persistence, Smart Recovery, OKX Pagination) and provides clear setup instructions.
-
-You can copy-paste this directly into your GitHub repository.
-
------
-
 # Fydblock Grid Trading Engine 🚀
 
 **Fydblock** is a high-performance, self-hosted **Grid Trading Bot** engine designed for cryptocurrency markets. Built for stability and precision, it automates "buy low, sell high" strategies with enterprise-grade features like **SQLite persistence**, **anti-flicker protection**, and **multi-exchange support** (Binance, OKX, Bybit).
