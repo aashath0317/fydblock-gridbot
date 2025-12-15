@@ -158,7 +158,7 @@ class GridTradingBot:
         self.logger.info(f"Handling START_BOT event: {reason}")
         await self.restart()
 
-    async def _stop(self) -> None:
+    async def _stop(self, sell_assets: bool = False) -> None:
         if not self.is_running:
             self.logger.info("Bot is not running. Nothing to stop.")
             return
@@ -167,7 +167,8 @@ class GridTradingBot:
 
         try:
             await self.order_status_tracker.stop_tracking()
-            await self.strategy.stop()
+            # Pass sell_assets flag to strategy
+            await self.strategy.stop(sell_assets=sell_assets)
             self.is_running = False
 
         except Exception as e:
