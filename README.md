@@ -1,367 +1,141 @@
-# Grid Trading Bot
+Here is a complete, professional `README.md` file tailored for your **Fydblock** project. It highlights the advanced features we just implemented (Database Persistence, Smart Recovery, OKX Pagination) and provides clear setup instructions.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![on_push_or_merge_pr_master](https://github.com/jordantete/grid_trading_bot/actions/workflows/run-tests-on-push-or-merge-pr-master.yml/badge.svg)](https://github.com/jordantete/grid_trading_bot/actions/workflows/run-tests-on-push-or-merge-pr-master.yml)
-[![codecov](https://codecov.io/github/jordantete/grid_trading_bot/graph/badge.svg?token=DOZRQAXAK7)](https://codecov.io/github/jordantete/grid_trading_bot)
+You can copy-paste this directly into your GitHub repository.
 
-Open-source Grid Trading Bot implemented in Python, allowing you to backtest and execute grid trading strategies on cryptocurrency markets. The bot is highly customizable and works with various exchanges using the CCXT library.
+-----
 
-## 📚 Table of Contents
+# Fydblock Grid Trading Engine 🚀
 
-- [Grid Trading Bot](#grid-trading-bot)
-- [Features](#features)
-- [🤔 What is Grid Trading?](#-what-is-grid-trading)
-  - [🔢 Arithmetic Grid Trading](#-arithmetic-grid-trading)
-  - [📐 Geometric Grid Trading](#-geometric-grid-trading)
-  - [📅 When to Use Each Type?](#-when-to-use-each-type)
-  - [🆚 Simple Grid vs. Hedged Grid Strategies](#-simple-grid-vs-hedged-grid-strategies)
-- [🖥️ Installation](#️-installation)
-  - [Prerequisites](#prerequisites)
-  - [Setting Up the Environment](#setting-up-the-environment)
-- [📋 Configuration](#-configuration)
-  - [Example Configuration File](#example-configuration-file)
-  - [Parameters](#parameters)
-  - [Environment Variables (.env)](#environment-variables-env)
-- [🏃 Running the Bot](#-running-the-bot)
-  - [Basic Usage](#basic-usage)
-  - [Multiple Configurations](#multiple-configurations)
-  - [Saving Performance Results](#saving-performance-results)
-  - [Disabling Plots](#disabling-plots)
-  - [Combining Options](#combining-options)
-  - [Available Command-Line Arguments](#available-command-line-arguments)
-- [📊 Docker Compose for Logs Management](#-docker-compose-for-logs-management)
-  - [Steps to Set Up](#steps-to-set-up)
-- [🤝 Contributing](#-contributing)
-  - [Reporting Issues](#reporting-issues)
-- [💸 Donations](#-donations)
-- [📜 License](#-license)
-- [🚨 Disclaimer](#-disclaimer)
+**Fydblock** is a high-performance, self-hosted **Grid Trading Bot** engine designed for cryptocurrency markets. Built for stability and precision, it automates "buy low, sell high" strategies with enterprise-grade features like **SQLite persistence**, **anti-flicker protection**, and **multi-exchange support** (Binance, OKX, Bybit).
 
-## Features
+Unlike simple bots, Fydblock features a robust **Integrity Watchdog** that constantly reconciles local state with the exchange to prevent order drift, duplicates, or "zombie" orders.
 
-- **Backtesting**: Simulate your grid trading strategy using historical data.
-- **Live Trading**: Execute trades on live markets using real funds, supported by robust configurations and risk management.
-- **Paper Trading**: Test strategies in a simulated live market environment without risking actual funds.
-- **Multiple Grid Trading Strategies**: Implement different grid trading strategies to match market conditions.
-- **Customizable Configurations**: Use a JSON file to define grid levels, strategies, and risk settings.
-- **Support for Multiple Exchanges**: Seamless integration with multiple cryptocurrency exchanges via the CCXT library.
-- **Take Profit & Stop Loss**: Safeguard your investments with configurable take profit and stop loss thresholds.
-- **Performance Metrics**: Gain insights with comprehensive metrics like ROI, max drawdown, run-up, and more.
-- **HealthCheck**: Continuously monitor the bot’s performance and system resource usage to ensure stability.
-- **CLI BotController**: Control and interact with the bot in real time using intuitive commands.
-- **Logging with Grafana**: Centralized logging system for monitoring bot activity and debugging, enhanced with visual dashboards.
+-----
 
-## 🤔 What is Grid Trading?
+## 🌟 Key Features
 
-Grid trading is a trading strategy that places buy and sell orders at predefined intervals above and below a set price. The goal is to capitalize on market volatility by buying low and selling high at different price points. There are two primary types of grid trading: **arithmetic** and **geometric**.
+  * **🛡️ Robust Persistence:** Uses **SQLite** to track every order state locally. Your bot remembers its exact grid positions even after a crash or restart.
+  * **⚡ Anti-Flicker & Integrity Check:** A smart background "Watchdog" loop constantly verifies order status against the exchange, automatically restoring missing orders or cancelling zombies—without spamming the API.
+  * **🧹 Smart Clean Start:** Automatically detects and wipes old orders from previous sessions before starting, ensuring a clean grid every time.
+  * **💸 Real-Time Profit Sync:** Automatically calculates gross/net profit and syncs data to your backend dashboard.
+  * **🔄 Multi-Exchange Support:** Built on **CCXT Pro**, supporting:
+      * **Binance** (Spot & Futures)
+      * **OKX** (Deep pagination support included)
+      * **Bybit**
+      * **Kraken**
+  * **📉 Dynamic Grid Management:** Automatically calculates geometric or arithmetic grids based on your investment cap and available balance.
 
-### 🔢 **Arithmetic Grid Trading**
+-----
 
-In an arithmetic grid, the grid levels (price intervals) are spaced **equally**. The distance between each buy and sell order is constant, providing a more straightforward strategy for fluctuating markets.
+## 🛠️ Installation
 
-#### **Example**
+### 1\. Prerequisites
 
-Suppose the price of a cryptocurrency is $3000, and you set up a grid with the following parameters:
+  * **Python 3.10+**
+  * **Redis** (Required for the Event Bus)
+  * **Node.js Backend** (Optional, for dashboard data sync)
 
-- **Grid levels**: $2900, $2950, $3000, $3050, $3100
-- **Buy orders**: Set at $2900 and $2950
-- **Sell orders**: Set at $3050 and $3100
+### 2\. Clone & Install
 
-As the price fluctuates, the bot will automatically execute buy orders as the price decreases and sell orders as the price increases. This method profits from small, predictable price fluctuations, as the intervals between buy/sell orders are consistent (in this case, $50).
+```bash
+git clone https://github.com/yourusername/fydblock-engine.git
+cd fydblock-engine
 
-### 📐 **Geometric Grid Trading**
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate  # Windows: venv\Scripts\activate
 
-In a geometric grid, the grid levels are spaced **proportionally** or by a percentage. The intervals between price levels increase or decrease exponentially based on a set percentage, making this grid type more suited for assets with higher volatility.
-
-#### **Simple Example**
-
-Suppose the price of a cryptocurrency is $3000, and you set up a geometric grid with a 5% spacing between levels. The price intervals will not be equally spaced but will grow or shrink based on the percentage.
-
-- **Grid levels**: $2700, $2835, $2975, $3125, $3280
-- **Buy orders**: Set at $2700 and $2835
-- **Sell orders**: Set at $3125 and $3280
-
-As the price fluctuates, buy orders are executed at lower levels and sell orders at higher levels, but the grid is proportional. This strategy is better for markets that experience exponential price movements.
-
-### 📅 **When to Use Each Type?**
-
-- **Arithmetic grids** are ideal for assets with more stable, linear price fluctuations.
-- **Geometric grids** are better for assets with significant, unpredictable volatility, as they adapt more flexibly to market swings.
-
-
-### 🆚 Simple Grid vs. Hedged Grid Strategies
-
-- **Simple Grid**: Independent buy and sell grids. Profits from each grid level are standalone.
-- **Hedged Grid**: Pairs buy and sell levels dynamically, balancing risk and reward for higher volatility markets.
-
-## 🖥️ Installation
-
-### Prerequisites
-
-This project leverages [uv](https://github.com/astral-sh/uv) for managing virtual environments and dependencies. Below, you’ll find instructions for getting started with uv, along with an alternative approach using **venv**. While not covered in detail here, you can also easily set up the project using **Poetry**.
-
-### Setting Up the Environment
-
-#### Using `uv` (Recommended)
-
-1. **Install `uv` (if not already installed)**
-   Ensure `uv` is installed on your system. If not, install it with `pip`:
-  ```sh
-  pip install uv
-  ```
-
-2. **Clone the repository**:
-  ```sh
-  git clone https://github.com/jordantete/grid_trading_bot.git
-  cd grid_trading_bot
-  ```
-
-3.  **Install Dependencies and Set Up Virtual Environment**:
-  Run the following command to automatically set up a virtual environment and install all dependencies defined in `pyproject.toml`:
-  ```sh
-   uv sync --all-extras --dev
-  ```
-
-#### Using `venv` and `pip` (Alternative)
-
-1. **Clone the repository**:
-  ```sh
-  git clone https://github.com/jordantete/grid_trading_bot.git
-  cd grid_trading_bot
-  ```
-
-2. **Set up a virtual environment**:
-  Create and activate a virtual environment:
-
-  ```sh
-  python3 -m venv .venv
-  source .venv/bin/activate  # On Windows: .venv\Scripts\activate
-  ```
-
-2. **Install dependencies**:
-  Use pip to install the dependencies listed in `pyproject.toml`:
-
-  ```sh
-  pip install -r requirements.txt
-  ```
-
-  Note: You may need to generate a requirements.txt file from pyproject.toml if it’s not already present. You can use a tool like pipreqs or manually extract dependencies.
-
-## 📋 Configuration
-
-The bot is configured via a JSON file `config/config.json` to suit your trading needs, alongside a `.env` file to securely store sensitive credentials and environment variables. Below is an example configuration file and a breakdown of all parameters.
-
-### **Example Configuration File**
-```json
-{
-  "exchange": {
-    "name": "binance",
-    "trading_fee": 0.001,
-    "trading_mode": "backtest"
-  },
-  "pair": {
-    "base_currency": "SOL",
-    "quote_currency": "USDT"
-  },
-  "trading_settings": {
-    "timeframe": "1m",
-    "period": {
-      "start_date": "2024-08-01T00:00:00Z",
-      "end_date": "2024-10-20T00:00:00Z"
-    },
-    "initial_balance": 10000,
-    "historical_data_file": "data/SOL_USDT/2024/1m.csv"
-  },
-  "grid_strategy": {
-    "type": "simple_grid",
-    "spacing": "geometric",
-    "num_grids": 8,
-    "range": {
-      "top": 200,
-      "bottom": 250
-    }
-  },
-  "risk_management": {
-    "take_profit": {
-      "enabled": false,
-      "threshold": 300
-    },
-    "stop_loss": {
-      "enabled": false,
-      "threshold": 150
-    }
-  },
-  "logging": {
-    "log_level": "INFO",
-    "log_to_file": true
-  }
-}
+# Install dependencies
+pip install -r requirements.txt
 ```
 
-### **Parameters**
+### 3\. Database Setup
 
-- **exchange**: Defines the exchange and trading fee to be used.
-  - **name**: The name of the exchange (e.g., binance).
-  - **trading_fee**: The trading fee should be in decimal format (e.g., 0.001 for 0.1%).
-  - **trading_mode**: The trading mode of operation (backtest, live or paper trading).
+No manual setup required\! The bot automatically initializes `bot_data.db` (SQLite) in the `core/storage/` directory on the first run.
 
-- **pair**: Specifies the trading pair.
-  - **base_currency**: The base currency (e.g., ETH).
-  - **quote_currency**: The quote currency (e.g., USDT).
+-----
 
-- **trading_settings**: General trading settings.
-  - **timeframe**: Time interval for the data (e.g., `1m` for one minute).
-  - **period**: The start and end dates for the backtest or trading period.
-    - **start_date**: The start date of the trading or backtest period.
-    - **end_date**: The end date of the trading or backtest period.
-  - **initial_balance**: Starting balance for the bot.
-  - **historical_data_file**: Path to a local historical data file for offline testing (optional).
+## ⚙️ Configuration
 
-- **grid_strategy**: Defines the grid trading parameters.
-  - **type**: Type of grid strategy:
-    - **simple_grid**: Independent buy/sell levels.
-    - **hedged_grid**: Dynamically paired buy/sell levels for risk balancing.
-  - **spacing**: Grid spacing type:
-    - **arithmetic**: Equal price intervals.
-    - **geometric**: Proportional price intervals based on percentage.
-  - **num_grids**: The total number of grid levels.
-  - **range**: Defines the price range of the grid.
-    - **top**: The upper price limit of the grid.
-    - **bottom**: The lower price limit of the grid.
+Configure your bot using environment variables in a `.env` file:
 
-- **risk_management**: Configurations for risk management.
-  - **take_profit**: Settings for taking profit.
-    - **enabled**: Whether the take profit is active.
-    - **threshold**: The price at which to take profit.
-  - **stop_loss**: Settings for stopping loss.
-    - **enabled**: Whether the stop loss is active.
-    - **threshold**: The price at which to stop loss.
+```env
+# Exchange Credentials
+EXCHANGE_API_KEY=your_api_key
+EXCHANGE_SECRET_KEY=your_secret_key
+EXCHANGE_PASSWORD=your_passphrase  # Required for OKX/KuCoin
 
-- **logging**: Configures logging settings.
-  - **log_level**: The logging level (e.g., `INFO`, `DEBUG`).
-  - **log_to_file**: Enables logging to a file.
-
-### **Environment Variables (.env)**
-
-The `.env` file securely stores sensitive data like API keys and credentials. Below is an example:
-
-```
-# Exchange API credentials
-EXCHANGE_API_KEY=YourExchangeAPIKeyHere
-EXCHANGE_SECRET_KEY=YourExchangeSecretKeyHere
-
-# Notification URLs for Apprise
-APPRISE_NOTIFICATION_URLS=
-
-# Grafana Admin Access
-GRAFANA_ADMIN_USER=admin
-GRAFANA_ADMIN_PASSWORD=YourGrafanaPasswordHere
+# Bot Settings
+TRADING_MODE=paper_trading       # or 'live' or 'backtest'
+EXCHANGE_NAME=okx                # binance, bybit, okx
+BASE_CURRENCY=SOL
+QUOTE_CURRENCY=USDT
+INITIAL_BALANCE=1000.0           # Investment Cap
 ```
 
-**Environment Variables Breakdown**
+-----
 
-- `EXCHANGE_API_KEY`: Your API key for the exchange.
-- `EXCHANGE_SECRET_KEY`: Your secret key for the exchange.
-- `APPRISE_NOTIFICATION_URLS`: URLs for notifications (e.g., Telegram bot, Discord Server). For detailed setup instructions, visit the [Apprise GitHub repository](https://github.com/caronc/apprise).
-- `GRAFANA_ADMIN_USER`: Admin username for Grafana.
-- `GRAFANA_ADMIN_PASSWORD`: Admin password for Grafana.
+## 🚀 Usage
 
-## 🏃 Running the Bot
+### Run the Bot
 
-To run the bot, use the following command:
+```bash
+python main.py
+```
 
-> **Note:** If you're using `uv` to manage your virtual environment, make sure to prefix the command with `uv run` to ensure it runs within the environment.
+### Docker Support
 
-### Basic Usage:
-  ```sh
-  uv run python main.py --config config/config.json
-  ```
+Deploy easily with Docker Compose:
 
-### Multiple Configurations:
-If you want to run the bot with multiple configuration files simultaneously, you can specify them all:
-  ```sh
-  uv run python main.py --config config/config1.json config/config2.json config/config3.json
-  ```
+```bash
+docker-compose up --build -d
+```
 
-### Saving Performance Results:
-To save the performance results to a file, use the **--save_performance_results** option:
-  ```sh
-  uv run python main.py --config config/config.json --save_performance_results results.json
-  ```
+-----
 
-### Disabling Plots:
-To run the bot without displaying the end-of-simulation plots, use the **--no-plot** flag:
-  ```sh
-  uv run python main.py --config config/config.json --no-plot
-  ```
+## 🏗️ Architecture & Core Components
 
-### Combining Options:
-You can combine multiple options to customize how the bot runs. For example:
-  ```sh
-  uv run python main.py --config config/config1.json config/config2.json --save_performance_results combined_results.json --no-plot
-  ```
+The system is built on a modular **Event-Driven Architecture**:
 
-### Available Command-Line Arguments:
+1.  **`GridTradingBot`**: The main controller. Manages the lifecycle (Start/Stop/Restart) and initializes components.
+2.  **`OrderManager`**: The "Brain". Decides when to place orders. It checks the **SQLite DB** first to prevent duplicates.
+3.  **`LiveExchangeService`**: Handles low-level API calls. Includes smart **pagination loops** to fetch \>100 orders from exchanges like OKX without hitting limit errors.
+4.  **`BalanceTracker`**: Keeps real-time track of Fiat/Crypto holdings, accounting for exchange fees.
+5.  **`Integrity Watchdog`**: A background task that runs every 5 seconds to reconcile the DB state with the Exchange state.
 
-| **Argument**                  | **Type**   | **Required** | **Description**                                                                 |
-|-------------------------------|------------|--------------|---------------------------------------------------------------------------------|
-| `--config`                    | `str`      | ✅ Yes       | Path(s) to configuration file(s). Multiple files can be provided.              |
-| `--save_performance_results`  | `str`      | ❌ No        | Path to save simulation results (e.g., `results.json`).                        |
-| `--no-plot`                   | `flag`     | ❌ No        | Disable the display of plots at the end of the simulation.                     |
-| `--profile`                   | `flag`     | ❌ No        | Enable profiling to analyze performance metrics during execution.              |
+-----
 
+## 🔧 Troubleshooting Common Issues
 
-## 📊 Docker Compose for Logs Management
+### 1\. "Parameter limit error" on OKX
 
-A `docker-compose.yml` file is included to set up centralized logging using Grafana, Loki, and Promtail. This allows you to monitor and analyze the bot's logs efficiently.
+  * **Cause:** Trying to fetch too many orders in a single API call (e.g., asking for 500 when the limit is 100).
+  * **Solution:** Fydblock's `LiveExchangeService` now includes a custom pagination loop that fetches orders in batches of 100 until all data is retrieved.
 
-### Steps to Set Up:
+### 2\. "Duplicate Orders" (e.g., 120 orders instead of 80)
 
-1. **Ensure Docker and Docker Compose Are Installed**
-  Verify that Docker and Docker Compose are installed on your system. If not, follow the official [Docker installation guide](https://docs.docker.com/get-docker/).
+  * **Cause:** Bot restarts without clearing the previous session's orders.
+  * **Solution:** The `OrderManager` performs an **Aggressive Clean Start**, verifying 0 open orders on the exchange before placing a single new grid.
 
+### 3\. "Insufficient Funds" Spam
 
-2. **Start the Services**
-  Run the following command to spin up Grafana, Loki, and Promtail:
+  * **Cause:** The Integrity Watchdog trying to refill gaps when the wallet is empty.
+  * **Solution:** The reconciliation logic now checks `has_fiat` and `has_crypto` flags before attempting recovery, preventing error loops.
 
-  ```sh
-  docker-compose up -d
-  ```
-
-
-3. **Access Grafana Dashboards**
-
-  Navigate to http://localhost:3000 in your browser to access the Grafana dashboard.
-  Use the following default credentials to log in:
-
-	- Username: admin
-	- Password: YourGrafanaPasswordHere (as defined in the .env file)
-
-4. **Import Dashboards**
-
-  Go to the Dashboards section in Grafana and click Import. Use the provided JSON file for predefined dashboards. This file can be found in the project directory: ```grafana/dashboards/grid_trading_bot_dashboard.json```
-
+-----
 
 ## 🤝 Contributing
 
-Contributions are welcome! If you have suggestions or want to improve the bot, feel free to fork the repository and submit a pull request.
+Contributions are welcome\! Please open an issue or submit a Pull Request.
 
-### Reporting Issues
+1.  Fork the repo
+2.  Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3.  Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4.  Push to the branch (`git push origin feature/AmazingFeature`)
+5.  Open a Pull Request
 
-If you encounter any issues or have feature requests, please create a new issue on the [GitHub Issues](https://github.com/pownedjojo/grid_trading_bot/issues) page.
+-----
 
-## 💸 Donations
+## 📄 License
 
-If you find this project helpful and would like to support its development, consider buying me a coffee! Your support is greatly appreciated and motivates me to continue improving and adding new features.
-
-[![Buy Me A Coffee](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/pownedj)
-
-Thank you for your support!
-
-## 📜 License
-
-This project is licensed under the MIT License. See the [LICENSE](./LICENSE.txt) file for more details.
-
-## 🚨 Disclaimer
-
-This project is intended for educational purposes only. The authors and contributors are not responsible for any financial losses incurred while using this bot. Trading cryptocurrencies involves significant risk and can result in the loss of all invested capital. Please do your own research and consult with a licensed financial advisor before making any trading decisions. Use this software at your own risk.
+Distributed under the MIT License. See `LICENSE` for more information.
