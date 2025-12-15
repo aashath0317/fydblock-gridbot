@@ -27,12 +27,12 @@ class GridManager:
 
     def initialize_grids_and_levels(self) -> None:
         """
-        Initializes the grid levels and assigns their respective states based on the chosen strategy.
+        Initializes the grid levels and assigns their respective states.
         """
         self.price_grids, self.central_price = self._calculate_price_grids_and_central_price()
 
         if self.strategy_type == StrategyType.SIMPLE_GRID:
-            # Initial static assignment - will be refined by update_zones_based_on_price
+            # Initial static assignment
             self.sorted_buy_grids = [price_grid for price_grid in self.price_grids if price_grid <= self.central_price]
             self.sorted_sell_grids = [price_grid for price_grid in self.price_grids if price_grid > self.central_price]
             self.grid_levels = {
@@ -60,7 +60,7 @@ class GridManager:
     def update_zones_based_on_price(self, current_price: float) -> None:
         """
         Re-aligns the Buy/Sell zones based on the actual Current Market Price.
-        This eliminates the 'Dead Zone' where grids between Config-Center and Market-Price get skipped.
+        FIX: Ensures we do not overwrite states of active/busy grids.
         """
         if self.strategy_type != StrategyType.SIMPLE_GRID:
             return
@@ -73,14 +73,21 @@ class GridManager:
         for price in self.price_grids:
             grid_level = self.grid_levels[price]
 
-            # If grid is below current price -> It must be a BUY zone (waiting to buy low)
-            # If grid is above current price -> It must be a SELL zone (waiting to sell high)
+            # 1. Determine ideal state based on price
+            ideal_state = GridCycleState.READY_TO_BUY if price < current_price else GridCycleState.READY_TO_SELL
+
+            # 2. Assign to Buy/Sell lists for OrderManager
             if price < current_price:
-                grid_level.state = GridCycleState.READY_TO_BUY
                 self.sorted_buy_grids.append(price)
             else:
-                grid_level.state = GridCycleState.READY_TO_SELL
                 self.sorted_sell_grids.append(price)
+
+            # 3. FIX: Only update state if the grid is IDLE.
+            # If it's WAITING_FOR_FILL, it has a live order. Do NOT touch it.
+            if grid_level.state in [GridCycleState.READY_TO_BUY, GridCycleState.READY_TO_SELL]:
+                grid_level.state = ideal_state
+            else:
+                self.logger.info(f"   Skipping state update for busy grid {price} (State: {grid_level.state})")
 
         self.logger.info(f"   ? New Buy Grids: {len(self.sorted_buy_grids)}")
         self.logger.info(f"   ? New Sell Grids: {len(self.sorted_sell_grids)}")
@@ -108,8 +115,6 @@ class GridManager:
         current_crypto_value_in_fiat = current_crypto_balance * current_price
         total_portfolio_value = current_fiat_balance + current_crypto_value_in_fiat
 
-        # Calculate target based on actual Sell Grids (Grids above price)
-        # This ensures we only buy what we strictly need for the upper sells
         sell_grid_count = len([p for p in self.price_grids if p > current_price])
         total_grid_count = len(self.price_grids)
 
@@ -136,14 +141,12 @@ class GridManager:
             self.logger.info(
                 f"Paired sell grid level {source_grid_level.price} with buy grid level {target_grid_level.price}.",
             )
-
         elif pairing_type == "sell":
             source_grid_level.paired_sell_level = target_grid_level
             target_grid_level.paired_buy_level = source_grid_level
             self.logger.info(
                 f"Paired buy grid level {source_grid_level.price} with sell grid level {target_grid_level.price}.",
             )
-
         else:
             raise ValueError(f"Invalid pairing type: {pairing_type}. Must be 'buy' or 'sell'.")
 
@@ -152,7 +155,6 @@ class GridManager:
         buy_grid_level: GridLevel,
     ) -> GridLevel | None:
         if self.strategy_type == StrategyType.SIMPLE_GRID:
-            # Enhanced logic: Find the next grid above
             sorted_prices = sorted(self.price_grids)
             try:
                 idx = sorted_prices.index(buy_grid_level.price)
@@ -166,21 +168,15 @@ class GridManager:
         elif self.strategy_type == StrategyType.HEDGED_GRID:
             sorted_prices = sorted(self.price_grids)
             current_index = sorted_prices.index(buy_grid_level.price)
-
             if current_index + 1 < len(sorted_prices):
                 paired_sell_price = sorted_prices[current_index + 1]
                 return self.grid_levels[paired_sell_price]
-
             return None
-
-        else:
-            self.logger.error(f"Unsupported strategy type: {self.strategy_type}")
-            return None
+        return None
 
     def get_grid_level_below(self, grid_level: GridLevel) -> GridLevel | None:
         sorted_levels = sorted(self.grid_levels.keys())
         current_index = sorted_levels.index(grid_level.price)
-
         if current_index > 0:
             lower_price = sorted_levels[current_index - 1]
             return self.grid_levels[lower_price]
@@ -192,7 +188,6 @@ class GridManager:
         order: Order,
     ) -> None:
         grid_level.add_order(order)
-
         if order.side == OrderSide.BUY:
             grid_level.state = GridCycleState.WAITING_FOR_BUY_FILL
             self.logger.info(f"Buy order placed and marked as pending at grid level {grid_level.price}.")
@@ -216,8 +211,6 @@ class GridManager:
 
             elif order_side == OrderSide.SELL:
                 # FIX: Prevent race condition.
-                # If a higher grid already filled and placed a buy here (setting it to WAITING_FOR_BUY_FILL),
-                # we MUST NOT reset it to READY_TO_BUY, or we lose that pending order.
                 if grid_level.state == GridCycleState.WAITING_FOR_BUY_FILL:
                     self.logger.info(
                         f"Sell order completed at {grid_level.price}, but level is already "
@@ -248,7 +241,6 @@ class GridManager:
                 )
                 if grid_level.paired_buy_level:
                     grid_level.paired_buy_level.state = GridCycleState.READY_TO_BUY
-
         else:
             self.logger.error("Unexpected strategy type")
 
@@ -259,7 +251,19 @@ class GridManager:
     ) -> bool:
         if self.strategy_type == StrategyType.SIMPLE_GRID:
             if order_side == OrderSide.BUY:
-                return grid_level.state == GridCycleState.READY_TO_BUY
+                # 1. Self Check
+                if grid_level.state != GridCycleState.READY_TO_BUY:
+                    return False
+
+                # 2. FIX: Check Neighbor (Paired Sell Level)
+                # If the level where we want to sell is busy, we cannot buy yet.
+                # This prevents "Grid Overlap" warnings and stuck bags.
+                paired_sell = self.get_paired_sell_level(grid_level)
+                if paired_sell and paired_sell.state == GridCycleState.WAITING_FOR_SELL_FILL:
+                    return False
+
+                return True
+
             elif order_side == OrderSide.SELL:
                 return grid_level.state == GridCycleState.READY_TO_SELL
 
@@ -281,7 +285,7 @@ class GridManager:
     def _calculate_price_grids_and_central_price(self) -> tuple[list[float], float]:
         bottom_range, top_range, num_grids, spacing_type = self._extract_grid_config()
 
-        # --- FIX: Ensure an odd number of grid lines to include a center point ---
+        # Ensure an odd number of grid lines to include a center point
         points_to_generate = num_grids
         if num_grids % 2 == 0:
             points_to_generate = num_grids + 1
@@ -307,7 +311,6 @@ class GridManager:
                     current_price *= ratio
                 central_index = len(grids) // 2
                 central_price = grids[central_index]
-
         else:
             raise ValueError(f"Unsupported spacing type: {spacing_type}")
 
