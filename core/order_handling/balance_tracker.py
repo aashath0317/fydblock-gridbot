@@ -43,6 +43,7 @@ class BalanceTracker:
         self.total_fees: float = 0
         self.reserved_fiat: float = 0.0
         self.reserved_crypto: float = 0.0
+        self.investment_cap: float = float("inf")
 
         # REMOVED: Automatic subscription. OrderManager will call update manually to ensure sequence.
         # self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
@@ -58,6 +59,7 @@ class BalanceTracker:
         """
         self.balance = initial_balance
         self.crypto_balance = initial_crypto_balance
+        self.investment_cap = initial_balance
 
         self.logger.info(
             f"Balance Tracker Initialized: {self.balance} {self.quote_currency} (Investment Cap) / {self.crypto_balance} {self.base_currency}"
@@ -88,6 +90,44 @@ class BalanceTracker:
             f"Base: {self.base_currency}: {base_balance}",
         )
         return quote_balance, base_balance
+
+    async def sync_balances(self, exchange_service: ExchangeInterface, current_price: float):
+        """
+        Forces an update of the available (free) balance from the exchange.
+        This ensures the bot doesn't try to spend funds it doesn't actually have.
+        """
+        try:
+            balances = await exchange_service.get_balance()
+            if balances and "free" in balances and "total" in balances:
+                # Update Available Fiat
+                free_fiat = float(balances["free"].get(self.quote_currency, 0.0))
+                free_crypto = float(balances["free"].get(self.base_currency, 0.0))
+
+                total_fiat = float(balances["total"].get(self.quote_currency, 0.0))
+                total_crypto = float(balances["total"].get(self.base_currency, 0.0))
+
+                crypto_equity_value = total_crypto * current_price
+
+                locked_fiat = total_fiat - free_fiat
+                target_total_fiat = max(0.0, self.investment_cap - crypto_equity_value)
+
+                max_allowed_free_fiat = max(0.0, target_total_fiat - locked_fiat)
+
+                new_fiat = min(free_fiat, max_allowed_free_fiat)
+                new_crypto = free_crypto
+
+                # Log only if there's a significant drift
+                if abs(new_fiat - self.balance) > 1.0 or abs(new_crypto - self.crypto_balance) > 0.01:
+                    self.logger.info(
+                        f"⚖️ Balance Synced: {self.balance:.2f} -> {new_fiat:.2f} {self.quote_currency} "
+                        f"(Wallet Free: {free_fiat:.2f}, Total Crypto Val: {crypto_equity_value:.2f}) | "
+                        f"{self.crypto_balance:.4f} -> {new_crypto:.4f} {self.base_currency}"
+                    )
+
+                self.balance = new_fiat
+                self.crypto_balance = new_crypto
+        except Exception as e:
+            self.logger.error(f"Failed to sync balances: {e}")
 
     # CHANGED: Renamed from _update_balance_on_order_completion to public method
     async def update_balance_on_order_completion(self, order: Order) -> None:
