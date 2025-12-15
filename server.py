@@ -1,32 +1,36 @@
 import asyncio
+from contextlib import asynccontextmanager
 import logging
+from typing import Any
+
+from adapter.config_adapter import DictConfigManager
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
-from contextlib import asynccontextmanager
+
+from config.config_validator import ConfigValidator
+from core.bot_management.event_bus import EventBus
 
 # --- Import Core Modules ---
 from core.bot_management.grid_trading_bot import GridTradingBot
-from core.bot_management.event_bus import EventBus
 from core.bot_management.notification.notification_handler import NotificationHandler
-from config.config_validator import ConfigValidator
-from adapter.config_adapter import DictConfigManager
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("FydEngine")
 
 # Store active bots: { bot_id: { "bot": GridTradingBot, "task": asyncio.Task } }
-active_instances: Dict[int, Dict[str, Any]] = {}
+active_instances: dict[int, dict[str, Any]] = {}
+
 
 # --- Data Models ---
 class StrategyConfig(BaseModel):
     upper_price: float
     lower_price: float
     grids: int
-    spacing: Optional[str] = "geometric"
+    spacing: str | None = "geometric"
     # Optional fallback for compatibility
-    investment: Optional[float] = None 
+    investment: float | None = None
+
 
 class BotRequest(BaseModel):
     bot_id: int
@@ -35,11 +39,12 @@ class BotRequest(BaseModel):
     pair: str
     api_key: str
     api_secret: str
-    passphrase: Optional[str] = None
+    passphrase: str | None = None
     mode: str = "live"
     strategy: StrategyConfig
     # Primary location for investment
-    investment: float = 0.0 
+    investment: float = 0.0
+
 
 class BacktestRequest(BaseModel):
     exchange: str
@@ -52,55 +57,32 @@ class BacktestRequest(BaseModel):
     gridSize: int
     timeframe: str = "1h"
 
+
 # --- Helper: Map Request to Bot Config ---
 def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strategy_settings, trading_settings):
-    base, quote = pair.split('/')
+    base, quote = pair.split("/")
     return {
-        "exchange": {
-            "name": exchange.lower(),
-            "trading_fee": 0.001,
-            "trading_mode": mode
-        },
-        "credentials": {
-            "api_key": api_key,
-            "api_secret": api_secret,
-            "password": passphrase 
-        },
-        "pair": {
-            "base_currency": base,
-            "quote_currency": quote
-        },
+        "exchange": {"name": exchange.lower(), "trading_fee": 0.001, "trading_mode": mode},
+        "credentials": {"api_key": api_key, "api_secret": api_secret, "password": passphrase},
+        "pair": {"base_currency": base, "quote_currency": quote},
         "trading_settings": trading_settings,
-        
         # Inject investment at root for ConfigManager
         "investment": trading_settings.get("initial_balance", 0.0),
-        
         "grid_strategy": {
             "type": "simple_grid",
-            "spacing": strategy_settings.get('spacing', 'geometric'),
-            "num_grids": strategy_settings['grids'],
-            "range": {
-                "top": strategy_settings['upper_price'],
-                "bottom": strategy_settings['lower_price']
-            },
+            "spacing": strategy_settings.get("spacing", "geometric"),
+            "num_grids": strategy_settings["grids"],
+            "range": {"top": strategy_settings["upper_price"], "bottom": strategy_settings["lower_price"]},
             # Also inject here for safety
-            "investment": trading_settings.get("initial_balance", 0.0)
+            "investment": trading_settings.get("initial_balance", 0.0),
         },
         "risk_management": {
-            "take_profit": {
-                "enabled": False,
-                "threshold": 0.0
-            },
-            "stop_loss": {
-                "enabled": False,
-                "threshold": 0.0
-            }
+            "take_profit": {"enabled": False, "threshold": 0.0},
+            "stop_loss": {"enabled": False, "threshold": 0.0},
         },
-        "logging": {
-            "log_level": "INFO",
-            "log_to_file": False
-        }
+        "logging": {"log_level": "INFO", "log_to_file": False},
     }
+
 
 # --- Lifecycle Management ---
 @asynccontextmanager
@@ -112,18 +94,21 @@ async def lifespan(app: FastAPI):
         bot = instance["bot"]
         logger.info(f"Stopping Bot {bot_id} and liquidating assets...")
         tasks.append(bot._stop(sell_assets=True))
-    
+
     if tasks:
         await asyncio.gather(*tasks)
     logger.info("All bots stopped and assets liquidated.")
+
 
 app = FastAPI(lifespan=lifespan)
 
 # --- API Endpoints ---
 
+
 @app.get("/")
 def health_check():
     return {"status": "online", "active_bots": len(active_instances)}
+
 
 @app.post("/start")
 async def start_bot(req: BotRequest):
@@ -132,7 +117,7 @@ async def start_bot(req: BotRequest):
 
     # --- 1. RESOLVE INVESTMENT AMOUNT ---
     final_investment = req.investment
-    
+
     # Fallback: If root investment is 0, check inside strategy (backward compatibility)
     if final_investment == 0 and req.strategy.investment is not None:
         final_investment = req.strategy.investment
@@ -141,28 +126,31 @@ async def start_bot(req: BotRequest):
 
     # --- 2. Prepare Config ---
     trading_settings = {
-        "initial_balance": final_investment, 
-        "investment": final_investment, 
+        "initial_balance": final_investment,
+        "investment": final_investment,
         "timeframe": "1m",
-        "period": {
-            "start_date": "2024-01-01T00:00:00Z", 
-            "end_date": "2070-01-01T00:00:00Z"
-        },
-        "historical_data_file": None
+        "period": {"start_date": "2024-01-01T00:00:00Z", "end_date": "2070-01-01T00:00:00Z"},
+        "historical_data_file": None,
     }
-    
+
     strategy_settings = {
         "grids": req.strategy.grids,
         "upper_price": req.strategy.upper_price,
         "lower_price": req.strategy.lower_price,
-        "spacing": req.strategy.spacing
+        "spacing": req.strategy.spacing,
     }
 
-    mode_str = "paper_trading" if req.mode == 'paper' else "live"
-    
+    mode_str = "paper_trading" if req.mode == "paper" else "live"
+
     config_dict = create_config(
-        req.exchange, req.pair, req.api_key, req.api_secret, req.passphrase,
-        mode_str, strategy_settings, trading_settings
+        req.exchange,
+        req.pair,
+        req.api_key,
+        req.api_secret,
+        req.passphrase,
+        mode_str,
+        strategy_settings,
+        trading_settings,
     )
 
     try:
@@ -170,7 +158,7 @@ async def start_bot(req: BotRequest):
         validator = ConfigValidator()
         # This will fail if initial_balance is missing or invalid
         config_manager = DictConfigManager(config_dict, validator)
-        
+
         event_bus = EventBus()
         notification_handler = NotificationHandler(event_bus, None, config_manager.get_trading_mode())
 
@@ -179,22 +167,20 @@ async def start_bot(req: BotRequest):
             config_manager=config_manager,
             notification_handler=notification_handler,
             event_bus=event_bus,
-            no_plot=True
+            no_plot=True,
+            bot_id=req.bot_id,
         )
 
         task = asyncio.create_task(bot.run())
-        
-        active_instances[req.bot_id] = {
-            "bot": bot,
-            "task": task,
-            "event_bus": event_bus
-        }
+
+        active_instances[req.bot_id] = {"bot": bot, "task": task, "event_bus": event_bus}
 
         return {"status": "started", "bot_id": req.bot_id}
 
     except Exception as e:
         logger.error(f"Failed to start bot {req.bot_id}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/stop/{bot_id}")
 async def stop_bot(bot_id: int):
@@ -203,18 +189,19 @@ async def stop_bot(bot_id: int):
 
     instance = active_instances[bot_id]
     bot = instance["bot"]
-    
+
     await bot._stop(sell_assets=True)
-    
+
     try:
         await asyncio.wait_for(instance["task"], timeout=5.0)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(f"Bot {bot_id} stop timed out, forcing removal.")
     except Exception as e:
         logger.error(f"Error stopping bot {bot_id}: {e}")
 
     del active_instances[bot_id]
     return {"status": "stopped"}
+
 
 @app.post("/backtest")
 async def run_backtest(req: BacktestRequest):
@@ -223,20 +210,19 @@ async def run_backtest(req: BacktestRequest):
             "initial_balance": req.capital,
             "investment": req.capital,
             "timeframe": req.timeframe,
-            "period": { "start_date": req.startDate, "end_date": req.endDate },
-            "historical_data_file": None 
+            "period": {"start_date": req.startDate, "end_date": req.endDate},
+            "historical_data_file": None,
         }
 
         strategy_settings = {
             "grids": req.gridSize,
             "upper_price": req.upperPrice,
             "lower_price": req.lowerPrice,
-            "spacing": "geometric"
+            "spacing": "geometric",
         }
 
         config_dict = create_config(
-            req.exchange, req.pair, "dummy_key", "dummy_secret", None,
-            "backtest", strategy_settings, trading_settings
+            req.exchange, req.pair, "dummy_key", "dummy_secret", None, "backtest", strategy_settings, trading_settings
         )
 
         validator = ConfigValidator()
@@ -249,7 +235,7 @@ async def run_backtest(req: BacktestRequest):
             config_manager=config_manager,
             notification_handler=notification_handler,
             event_bus=event_bus,
-            no_plot=True
+            no_plot=True,
         )
 
         logger.info(f"Starting backtest for {req.pair}...")
