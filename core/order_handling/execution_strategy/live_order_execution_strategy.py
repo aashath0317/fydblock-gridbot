@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 
 from core.services.exceptions import DataFetchError
 from core.services.exchange_interface import ExchangeInterface
@@ -27,56 +28,92 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
         self,
         order_side: OrderSide,
         pair: str,
-        quantity: float,
-        price: float,
-    ) -> Order | None:
-        for attempt in range(self.max_retries):
-            try:
-                raw_order = await self.exchange_service.place_order(
-                    pair,
-                    OrderType.MARKET.value.lower(),
-                    order_side.name.lower(),
-                    quantity,
-                    price,
-                )
-                order_result = await self._parse_order_result(raw_order)
+        amount: float,
+        price: float = None, 
+    ) -> Order:
+        try:
+            raw_order = await self.exchange_service.place_order(
+                pair,
+                OrderType.MARKET.value.lower(),
+                order_side.value.lower(),
+                amount,
+                price
+            )
 
-                if order_result.status == OrderStatus.CLOSED:
-                    return order_result  # Order fully filled
+            # --- SAFE PARSING START ---
+            parsed_amount = float(raw_order.get('amount') or amount)
+            parsed_filled = float(raw_order.get('filled') or parsed_amount)
+            
+            parsed_price = float(raw_order.get('price') or (price if price is not None else 0.0))
+            
+            parsed_average = raw_order.get('average')
+            if parsed_average is None:
+                parsed_average = parsed_price
+            else:
+                parsed_average = float(parsed_average)
 
-                elif order_result.status == OrderStatus.OPEN:
-                    await self._handle_partial_fill(order_result, pair)
+            parsed_cost = raw_order.get('cost')
+            if parsed_cost is None:
+                parsed_cost = parsed_price * parsed_filled
+            else:
+                parsed_cost = float(parsed_cost)
 
-                await asyncio.sleep(self.retry_delay)
-                self.logger.info(f"Retrying order. Attempt {attempt + 1}/{self.max_retries}.")
-                price = await self._adjust_price(order_side, price, attempt)
+            parsed_timestamp = raw_order.get('timestamp')
+            if parsed_timestamp is None:
+                parsed_timestamp = int(time.time() * 1000)
+            else:
+                parsed_timestamp = int(parsed_timestamp)
+                
+            parsed_fee = raw_order.get('fee')
+            if parsed_fee is None:
+                parsed_fee = {'cost': 0.0, 'currency': pair.split('/')[1] if '/' in pair else 'USDT'}
+            # --------------------------
 
-            except Exception as e:
-                self.logger.error(f"Attempt {attempt + 1} failed with error: {e!s}")
-                await asyncio.sleep(self.retry_delay)
+            return Order(
+                identifier=str(raw_order['id']),
+                symbol=pair,
+                side=order_side,
+                order_type=OrderType.MARKET,
+                status=OrderStatus.CLOSED,
+                timestamp=parsed_timestamp,
+                datetime=raw_order.get('datetime'), 
+                last_trade_timestamp=raw_order.get('lastTradeTimestamp'),
+                amount=parsed_amount,
+                filled=parsed_filled,
+                remaining=0.0, 
+                price=parsed_price,
+                average=parsed_average, 
+                time_in_force=raw_order.get('timeInForce'),
+                trades=raw_order.get('trades', []),
+                fee=parsed_fee, 
+                cost=parsed_cost,
+                info=raw_order
+            )
 
-        raise OrderExecutionFailedError(
-            "Failed to execute Market order after maximum retries.",
-            order_side,
-            OrderType.MARKET,
-            pair,
-            quantity,
-            price,
-        )
+        except Exception as e:
+            self.logger.error(f"Failed to execute Market order on {pair}: {e}")
+            raise OrderExecutionFailedError(
+                f"Failed to execute Market order on {pair}: {e}",
+                order_side,
+                OrderType.MARKET,
+                pair,
+                amount,
+                price if price is not None else 0.0
+            ) from e
 
     async def execute_limit_order(
         self,
         order_side: OrderSide,
         pair: str,
-        quantity: float,
+        amount: float, 
         price: float,
     ) -> Order | None:
         try:
             raw_order = await self.exchange_service.place_order(
                 pair,
                 OrderType.LIMIT.value.lower(),
-                order_side.name.lower(),
-                quantity,
+                order_side.value.lower(),
+                amount,
                 price,
             )
             order_result = await self._parse_order_result(raw_order)
@@ -89,7 +126,7 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
                 order_side,
                 OrderType.LIMIT,
                 pair,
-                quantity,
+                amount,
                 price,
             ) from e
 
@@ -100,7 +137,7 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
                 order_side,
                 OrderType.LIMIT,
                 pair,
-                quantity,
+                amount,
                 price,
             ) from e
 
@@ -126,31 +163,65 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
     ) -> Order:
         """
         Parses the raw order response from the exchange into an Order object.
-
-        Args:
-            raw_order_result: The raw response from the exchange.
-
-        Returns:
-            An Order object with standardized fields.
         """
+        ts = raw_order_result.get("timestamp")
+        if ts is None:
+            ts = int(time.time() * 1000)
+        else:
+            ts = int(ts)
+
+        price = float(raw_order_result.get("price") or 0.0)
+        amount = float(raw_order_result.get("amount") or 0.0)
+        filled = float(raw_order_result.get("filled") or 0.0)
+        
+        cost = raw_order_result.get("cost")
+        if cost is None:
+            cost = price * filled
+        else:
+            cost = float(cost)
+            
+        avg = raw_order_result.get("average")
+        if avg is None:
+            avg = price
+        else:
+            avg = float(avg)
+
+        fee = raw_order_result.get("fee")
+        if fee is None:
+            fee = {'cost': 0.0, 'currency': 'UNKNOWN'}
+
+        # --- CRITICAL FIX: Safe String Parsing ---
+        status_val = raw_order_result.get("status")
+        if status_val is None:
+            status_val = "open" # Default for new limit orders
+        
+        type_val = raw_order_result.get("type")
+        if type_val is None:
+            type_val = "limit" # Default if missing
+
+        side_val = raw_order_result.get("side")
+        if side_val is None:
+            side_val = "buy" # Should not happen, but safe fallback
+        # -----------------------------------------
+
         return Order(
             identifier=raw_order_result.get("id", ""),
-            status=OrderStatus(raw_order_result.get("status", "unknown").lower()),
-            order_type=OrderType(raw_order_result.get("type", "unknown").lower()),
-            side=OrderSide(raw_order_result.get("side", "unknown").lower()),
-            price=raw_order_result.get("price", 0.0),
-            average=raw_order_result.get("average"),
-            amount=raw_order_result.get("amount", 0.0),
-            filled=raw_order_result.get("filled", 0.0),
-            remaining=raw_order_result.get("remaining", 0.0),
-            timestamp=raw_order_result.get("timestamp", 0),
+            status=OrderStatus(status_val.lower()),
+            order_type=OrderType(type_val.lower()),
+            side=OrderSide(side_val.lower()),
+            price=price,
+            average=avg, 
+            amount=amount,
+            filled=filled,
+            remaining=float(raw_order_result.get("remaining") or 0.0),
+            timestamp=ts,
             datetime=raw_order_result.get("datetime"),
             last_trade_timestamp=raw_order_result.get("lastTradeTimestamp"),
             symbol=raw_order_result.get("symbol", ""),
             time_in_force=raw_order_result.get("timeInForce"),
             trades=raw_order_result.get("trades", []),
-            fee=raw_order_result.get("fee"),
-            cost=raw_order_result.get("cost"),
+            fee=fee, 
+            cost=cost, 
             info=raw_order_result.get("info", raw_order_result),
         )
 
@@ -193,3 +264,15 @@ class LiveOrderExecutionStrategy(OrderExecutionStrategyInterface):
 
             await asyncio.sleep(self.retry_delay)
         return False
+        
+    async def cancel_order(
+        self,
+        order_id: str,
+        pair: str,
+    ) -> bool:
+        try:
+            result = await self.exchange_service.cancel_order(order_id, pair)
+            return result.get("status") == "canceled"
+        except Exception as e:
+            self.logger.error(f"Failed to cancel order {order_id}: {e}")
+            return False

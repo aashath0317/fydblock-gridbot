@@ -31,3 +31,11 @@ class OrderExecutionStrategyInterface(ABC):
         pair: str,
     ) -> Order | None:
         pass
+        
+    @abstractmethod
+    async def cancel_order(
+        self,
+        order_id: str,
+        pair: str,
+    ) -> bool:
+        pass
