@@ -44,7 +44,8 @@ class BalanceTracker:
         self.reserved_fiat: float = 0.0
         self.reserved_crypto: float = 0.0
 
-        self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
+        # REMOVED: Automatic subscription. OrderManager will call update manually to ensure sequence.
+        # self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
 
     async def setup_balances(
         self,
@@ -95,7 +96,8 @@ class BalanceTracker:
         )
         return quote_balance, base_balance
 
-    async def _update_balance_on_order_completion(self, order: Order) -> None:
+    # CHANGED: Renamed from _update_balance_on_order_completion to public method
+    async def update_balance_on_order_completion(self, order: Order) -> None:
         """
         Updates the account balance and crypto balance when an order is filled.
 
@@ -200,7 +202,7 @@ class BalanceTracker:
             amount: The amount of fiat to reserve.
         """
         if self.balance < amount:
-            raise InsufficientBalanceError(f"Insufficient fiat balance to reserve {amount}.")
+            raise InsufficientBalanceError(f"Insufficient fiat balance to reserve {amount}. Available: {self.balance}")
 
         self.reserved_fiat += amount
         self.balance -= amount
@@ -217,7 +219,7 @@ class BalanceTracker:
             quantity: The quantity of crypto to reserve.
         """
         if self.crypto_balance < quantity:
-            raise InsufficientCryptoBalanceError(f"Insufficient crypto balance to reserve {quantity}.")
+            raise InsufficientCryptoBalanceError(f"Insufficient crypto balance to reserve {quantity}. Available: {self.crypto_balance}")
 
         self.reserved_crypto += quantity
         self.crypto_balance -= quantity

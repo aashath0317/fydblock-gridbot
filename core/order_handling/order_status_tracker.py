@@ -110,7 +110,8 @@ class OrderStatusTracker:
                         f"Remaining: {remote_order.remaining}.",
                     )
                 else:
-                    self.logger.info(f"Order {remote_order} is still open. No fills yet.")
+                    # CHANGED: Switched to debug to reduce log spam
+                    self.logger.debug(f"Order {remote_order} is still open. No fills yet.")
             else:
                 self.logger.warning(
                     f"Unhandled order status '{remote_order.status}' for order {remote_order.identifier}.",

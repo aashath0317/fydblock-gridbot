@@ -94,6 +94,10 @@ class OrderManager:
                     self.grid_manager.mark_order_pending(grid_level, order)
                     self.order_book.add_order(order, grid_level)
 
+                    if order.status == OrderStatus.CLOSED:
+                        self.logger.info(f"Initial Buy Order {order.identifier} filled immediately.")
+                        await self.event_bus.publish(Events.ORDER_FILLED, order)
+
                 except OrderExecutionFailedError as e:
                     self.logger.error(f"Failed to initialize buy order at grid level {price} - {e!s}", exc_info=True)
                     if "InsufficientFunds" in str(e) or "InsufficientCrypto" in str(e):
@@ -144,6 +148,10 @@ class OrderManager:
                     self.grid_manager.mark_order_pending(grid_level, order)
                     self.order_book.add_order(order, grid_level)
 
+                    if order.status == OrderStatus.CLOSED:
+                        self.logger.info(f"Initial Sell Order {order.identifier} filled immediately.")
+                        await self.event_bus.publish(Events.ORDER_FILLED, order)
+
                 except OrderExecutionFailedError as e:
                     self.logger.error(f"Failed to initialize sell order at grid level {price} - {e!s}", exc_info=True)
                     if "InsufficientFunds" in str(e) or "InsufficientCrypto" in str(e):
@@ -169,6 +177,9 @@ class OrderManager:
         order: Order,
     ) -> None:
         try:
+            # Update balance immediately to ensure funds are available for the next order.
+            await self.balance_tracker.update_balance_on_order_completion(order)
+
             grid_level = self.order_book.get_grid_level_for_order(order)
 
             if not grid_level:
@@ -227,6 +238,18 @@ class OrderManager:
     ) -> None:
         self.logger.info(f"Sell order completed at grid level {grid_level}.")
         self.grid_manager.complete_order(grid_level, OrderSide.SELL)
+        
+        # --- NEW PROFIT CALCULATION ---
+        paired_buy_level = grid_level.paired_buy_level
+        if paired_buy_level:
+             # Calculate Gross Profit: (Sell Price - Buy Price) * Amount
+             gross_profit = (order.average - paired_buy_level.price) * order.filled
+             self.logger.info(
+                 f"?? PROFIT SECURED: +{gross_profit:.4f} USDT "
+                 f"(Buy @ {paired_buy_level.price:.2f} -> Sell @ {order.average:.2f})"
+             )
+        # -------------------------------
+
         paired_buy_level = self._get_or_create_paired_buy_level(grid_level)
 
         if paired_buy_level:
@@ -241,6 +264,7 @@ class OrderManager:
             self.logger.info(f"Found valid paired buy level {paired_buy_level} for sell level {sell_grid_level}.")
             return paired_buy_level
 
+        # If pairing isn't explicit or state isn't ready (fallback for SIMPLE_GRID issues), find level below
         fallback_buy_level = self.grid_manager.get_grid_level_below(sell_grid_level)
 
         if fallback_buy_level:
@@ -256,30 +280,38 @@ class OrderManager:
         buy_grid_level: GridLevel,
         quantity: float,
     ) -> None:
-        adjusted_quantity = self.order_validator.adjust_and_validate_buy_quantity(
-            self.balance_tracker.balance,
-            quantity,
-            buy_grid_level.price,
-        )
-        
-        buy_order = await self.order_execution_strategy.execute_limit_order(
-            order_side=OrderSide.BUY,
-            pair=self.trading_pair,
-            amount=adjusted_quantity,
-            price=buy_grid_level.price,
-        )
-
-        if buy_order:
-            self.grid_manager.pair_grid_levels(sell_grid_level, buy_grid_level, pairing_type="buy")
-            self.balance_tracker.reserve_funds_for_buy(buy_order.amount * buy_grid_level.price)
-            self.grid_manager.mark_order_pending(buy_grid_level, buy_order)
-            self.order_book.add_order(buy_order, buy_grid_level)
-            await self.notification_handler.async_send_notification(
-                NotificationType.ORDER_PLACED,
-                order_details=str(buy_order),
+        try:
+            adjusted_quantity = self.order_validator.adjust_and_validate_buy_quantity(
+                self.balance_tracker.balance,
+                quantity,
+                buy_grid_level.price,
             )
-        else:
-            self.logger.error(f"Failed to place buy order at grid level {buy_grid_level}")
+            
+            buy_order = await self.order_execution_strategy.execute_limit_order(
+                order_side=OrderSide.BUY,
+                pair=self.trading_pair,
+                amount=adjusted_quantity,
+                price=buy_grid_level.price,
+            )
+
+            if buy_order:
+                self.grid_manager.pair_grid_levels(sell_grid_level, buy_grid_level, pairing_type="buy")
+                self.balance_tracker.reserve_funds_for_buy(buy_order.amount * buy_grid_level.price)
+                self.grid_manager.mark_order_pending(buy_grid_level, buy_order)
+                self.order_book.add_order(buy_order, buy_grid_level)
+                await self.notification_handler.async_send_notification(
+                    NotificationType.ORDER_PLACED,
+                    order_details=str(buy_order),
+                )
+
+                if buy_order.status == OrderStatus.CLOSED:
+                    self.logger.info(f"Buy Order {buy_order.identifier} filled immediately.")
+                    await self.event_bus.publish(Events.ORDER_FILLED, buy_order)
+
+            else:
+                self.logger.error(f"Failed to place buy order at grid level {buy_grid_level}")
+        except Exception as e:
+             self.logger.error(f"Exception during buy order placement: {e}", exc_info=True)
 
     async def _place_sell_order(
         self,
@@ -287,29 +319,37 @@ class OrderManager:
         sell_grid_level: GridLevel,
         quantity: float,
     ) -> None:
-        adjusted_quantity = self.order_validator.adjust_and_validate_sell_quantity(
-            self.balance_tracker.crypto_balance,
-            quantity,
-        )
-        
-        sell_order = await self.order_execution_strategy.execute_limit_order(
-            order_side=OrderSide.SELL,
-            pair=self.trading_pair,
-            amount=adjusted_quantity,
-            price=sell_grid_level.price,
-        )
-
-        if sell_order:
-            self.grid_manager.pair_grid_levels(buy_grid_level, sell_grid_level, pairing_type="sell")
-            self.balance_tracker.reserve_funds_for_sell(sell_order.amount)
-            self.grid_manager.mark_order_pending(sell_grid_level, sell_order)
-            self.order_book.add_order(sell_order, sell_grid_level)
-            await self.notification_handler.async_send_notification(
-                NotificationType.ORDER_PLACED,
-                order_details=str(sell_order),
+        try:
+            adjusted_quantity = self.order_validator.adjust_and_validate_sell_quantity(
+                self.balance_tracker.crypto_balance,
+                quantity,
             )
-        else:
-            self.logger.error(f"Failed to place sell order at grid level {sell_grid_level}.")
+            
+            sell_order = await self.order_execution_strategy.execute_limit_order(
+                order_side=OrderSide.SELL,
+                pair=self.trading_pair,
+                amount=adjusted_quantity,
+                price=sell_grid_level.price,
+            )
+
+            if sell_order:
+                self.grid_manager.pair_grid_levels(buy_grid_level, sell_grid_level, pairing_type="sell")
+                self.balance_tracker.reserve_funds_for_sell(sell_order.amount)
+                self.grid_manager.mark_order_pending(sell_grid_level, sell_order)
+                self.order_book.add_order(sell_order, sell_grid_level)
+                await self.notification_handler.async_send_notification(
+                    NotificationType.ORDER_PLACED,
+                    order_details=str(sell_order),
+                )
+
+                if sell_order.status == OrderStatus.CLOSED:
+                    self.logger.info(f"Sell Order {sell_order.identifier} filled immediately.")
+                    await self.event_bus.publish(Events.ORDER_FILLED, sell_order)
+
+            else:
+                self.logger.error(f"Failed to place sell order at grid level {sell_grid_level}.")
+        except Exception as e:
+             self.logger.error(f"Exception during sell order placement: {e}", exc_info=True)
 
     async def perform_initial_purchase(
         self,
@@ -333,7 +373,7 @@ class OrderManager:
         value_per_grid = total_balance_value / total_grid_count
         target_crypto_value = value_per_grid * sell_grid_count
 
-        self.logger.info("📊 Initial Purchase Analysis:")
+        self.logger.info("?? Initial Purchase Analysis:")
         self.logger.info(f"   Total Equity: {total_balance_value:.2f}")
         self.logger.info(f"   Grids Above Price (Sell): {sell_grid_count} / {total_grid_count}")
         self.logger.info(f"   Target Crypto Value: {target_crypto_value:.2f} ({(sell_grid_count/total_grid_count)*100:.1f}%)")
@@ -342,9 +382,8 @@ class OrderManager:
         shortfall_value = target_crypto_value - current_crypto_value
 
         if shortfall_value > 10.0: 
-            # FIX: Added 1% buffer to account for fees and slippage
             amount_to_buy = (shortfall_value / current_price) * 1.01
-            self.logger.info(f"   📉 Shortfall detected. Buying {amount_to_buy:.4f} SOL ({shortfall_value:.2f} USDT + buffer)...")
+            self.logger.info(f"   ?? Shortfall detected. Buying {amount_to_buy:.4f} SOL ({shortfall_value:.2f} USDT + buffer)...")
 
             try:
                 adjusted_quantity = self.order_validator.adjust_and_validate_buy_quantity(
@@ -360,7 +399,7 @@ class OrderManager:
                     price=current_price,
                 )
                 
-                self.logger.info(f"✅ Initial purchase successful: {buy_order}")
+                self.logger.info(f"? Initial purchase successful: {buy_order}")
                 self.order_book.add_order(buy_order)
                 
                 if self.trading_mode != TradingMode.BACKTEST:
@@ -377,7 +416,7 @@ class OrderManager:
                 self.logger.error(f"Failed to execute initial purchase: {e}")
                 raise e
         else:
-            self.logger.info(f"   ✅ Sufficient Crypto Held ({current_crypto_value:.2f} vs Target {target_crypto_value:.2f}). No buy needed.")
+            self.logger.info(f"   ? Sufficient Crypto Held ({current_crypto_value:.2f} vs Target {target_crypto_value:.2f}). No buy needed.")
 
     async def execute_take_profit_or_stop_loss_order(
         self,
@@ -453,3 +492,37 @@ class OrderManager:
             f"with amount {order.amount}. Filled at timestamp {formatted_timestamp}",
         )
         await self.event_bus.publish(Events.ORDER_FILLED, order)
+        
+    async def cancel_all_open_orders(self) -> None:
+        """
+        Cancels all currently open orders in the order book.
+        """
+        open_orders = self.order_book.get_open_orders()
+        self.logger.info(f"Cancelling {len(open_orders)} open orders...")
+        
+        for order in open_orders:
+            try:
+                await self.order_execution_strategy.cancel_order(order.identifier, self.trading_pair)
+                self.logger.info(f"Cancelled order {order.identifier}")
+            except Exception as e:
+                self.logger.error(f"Failed to cancel order {order.identifier}: {e}")
+
+    async def liquidate_positions(self, current_price: float) -> None:
+        """
+        Sells all remaining crypto balance to Quote currency (e.g., USDT).
+        """
+        crypto_balance = self.balance_tracker.crypto_balance
+        if crypto_balance > 0:
+            self.logger.info(f"Liquidating {crypto_balance} {self.trading_pair} at market price...")
+            try:
+                await self.order_execution_strategy.execute_market_order(
+                    OrderSide.SELL,
+                    self.trading_pair,
+                    crypto_balance,
+                    current_price
+                )
+                self.logger.info("Liquidation successful.")
+            except Exception as e:
+                self.logger.error(f"Failed to liquidate positions: {e}")
+        else:
+            self.logger.info("No crypto balance to liquidate.")
