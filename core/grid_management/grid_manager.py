@@ -1,4 +1,5 @@
 import logging
+
 import numpy as np
 
 from config.config_manager import ConfigManager
@@ -65,13 +66,13 @@ class GridManager:
             return
 
         self.logger.info(f"?? Re-aligning grid zones to Current Price: {current_price}")
-        
+
         self.sorted_buy_grids = []
         self.sorted_sell_grids = []
 
         for price in self.price_grids:
             grid_level = self.grid_levels[price]
-            
+
             # If grid is below current price -> It must be a BUY zone (waiting to buy low)
             # If grid is above current price -> It must be a SELL zone (waiting to sell high)
             if price < current_price:
@@ -106,20 +107,21 @@ class GridManager:
     ) -> float:
         current_crypto_value_in_fiat = current_crypto_balance * current_price
         total_portfolio_value = current_fiat_balance + current_crypto_value_in_fiat
-        
+
         # Calculate target based on actual Sell Grids (Grids above price)
         # This ensures we only buy what we strictly need for the upper sells
         sell_grid_count = len([p for p in self.price_grids if p > current_price])
         total_grid_count = len(self.price_grids)
-        
-        if total_grid_count == 0: return 0.0
+
+        if total_grid_count == 0:
+            return 0.0
 
         target_crypto_ratio = sell_grid_count / total_grid_count
         target_crypto_value = total_portfolio_value * target_crypto_ratio
-        
+
         fiat_to_allocate = target_crypto_value - current_crypto_value_in_fiat
         fiat_to_allocate = max(0, min(fiat_to_allocate, current_fiat_balance))
-        
+
         return fiat_to_allocate / current_price
 
     def pair_grid_levels(
@@ -128,7 +130,6 @@ class GridManager:
         target_grid_level: GridLevel,
         pairing_type: str,
     ) -> None:
-
         if pairing_type == "buy":
             source_grid_level.paired_buy_level = target_grid_level
             target_grid_level.paired_sell_level = source_grid_level
@@ -150,7 +151,6 @@ class GridManager:
         self,
         buy_grid_level: GridLevel,
     ) -> GridLevel | None:
-
         if self.strategy_type == StrategyType.SIMPLE_GRID:
             # Enhanced logic: Find the next grid above
             sorted_prices = sorted(self.price_grids)
@@ -212,15 +212,25 @@ class GridManager:
                     f"Buy order completed at grid level {grid_level.price}. Transitioning to READY_TO_SELL.",
                 )
                 if grid_level.paired_sell_level:
-                     grid_level.paired_sell_level.state = GridCycleState.READY_TO_SELL
+                    grid_level.paired_sell_level.state = GridCycleState.READY_TO_SELL
 
             elif order_side == OrderSide.SELL:
-                grid_level.state = GridCycleState.READY_TO_BUY
-                self.logger.info(
-                    f"Sell order completed at grid level {grid_level.price}. Transitioning to READY_TO_BUY.",
-                )
+                # FIX: Prevent race condition.
+                # If a higher grid already filled and placed a buy here (setting it to WAITING_FOR_BUY_FILL),
+                # we MUST NOT reset it to READY_TO_BUY, or we lose that pending order.
+                if grid_level.state == GridCycleState.WAITING_FOR_BUY_FILL:
+                    self.logger.info(
+                        f"Sell order completed at {grid_level.price}, but level is already "
+                        f"WAITING_FOR_BUY_FILL (claimed by neighbor). Keeping existing state."
+                    )
+                else:
+                    grid_level.state = GridCycleState.READY_TO_BUY
+                    self.logger.info(
+                        f"Sell order completed at grid level {grid_level.price}. Transitioning to READY_TO_BUY.",
+                    )
+
                 if grid_level.paired_buy_level:
-                     grid_level.paired_buy_level.state = GridCycleState.READY_TO_BUY
+                    grid_level.paired_buy_level.state = GridCycleState.READY_TO_BUY
 
         elif self.strategy_type == StrategyType.HEDGED_GRID:
             if order_side == OrderSide.BUY:
