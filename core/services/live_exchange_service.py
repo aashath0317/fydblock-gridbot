@@ -1,258 +1,288 @@
 import asyncio
-from collections.abc import Callable
 import logging
-import os
-from typing import Any
-
-from ccxt.base.errors import BaseError, ExchangeError, NetworkError, OrderNotFound
-import ccxt.pro as ccxtpro
-import pandas as pd
+import traceback
+from typing import TYPE_CHECKING, Any
 
 from config.config_manager import ConfigManager
-
-from .exceptions import (
-    DataFetchError,
-    MissingEnvironmentVariableError,
-    OrderCancellationError,
-    UnsupportedExchangeError,
+from config.trading_mode import TradingMode
+from core.bot_management.event_bus import EventBus, Events
+from core.grid_management.grid_manager import GridManager
+from core.order_handling.balance_tracker import BalanceTracker
+from core.order_handling.execution_strategy.order_execution_strategy_factory import (
+    OrderExecutionStrategyFactory,
 )
-from .exchange_interface import ExchangeInterface
+from core.order_handling.fee_calculator import FeeCalculator
+from core.order_handling.order_book import OrderBook
+from core.order_handling.order_manager import OrderManager
+from core.order_handling.order_status_tracker import OrderStatusTracker
+from core.services.exceptions import (
+    DataFetchError,
+    UnsupportedExchangeError,
+    UnsupportedTimeframeError,
+)
+from core.services.exchange_service_factory import ExchangeServiceFactory
+from core.validation.order_validator import OrderValidator
+from strategies.grid_trading_strategy import GridTradingStrategy
+from strategies.plotter import Plotter
+from strategies.trading_performance_analyzer import TradingPerformanceAnalyzer
+
+if TYPE_CHECKING:
+    from strategies.strategy_type import StrategyType
+
+from .notification.notification_handler import NotificationHandler
 
 
-class LiveExchangeService(ExchangeInterface):
-    def __init__(self, config_manager: ConfigManager, is_paper_trading_activated: bool):
-        self.config_manager = config_manager
-        self.is_paper_trading_activated = is_paper_trading_activated
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.exchange_name = self.config_manager.get_exchange_name()
-        
-        # --- FIXED: Use getattr to safely get keys from config adapter ---
-        self.api_key = getattr(config_manager, "get_api_key", lambda: None)() or os.getenv("EXCHANGE_API_KEY")
-        self.secret_key = getattr(config_manager, "get_api_secret", lambda: None)() or os.getenv("EXCHANGE_SECRET_KEY")
-        
-        # --- FIXED: Added retrieval of password ---
-        self.password = getattr(config_manager, "get_api_password", lambda: None)() or os.getenv("EXCHANGE_PASSWORD")
-
-        if not self.api_key or not self.secret_key:
-             raise MissingEnvironmentVariableError("API Key or Secret missing.")
-
-        self.exchange = self._initialize_exchange()
-        self.connection_active = False
-
-    def _get_env_variable(self, key: str) -> str:
-        value = os.getenv(key)
-        if value is None:
-            raise MissingEnvironmentVariableError(f"Missing required environment variable: {key}")
-        return value
-
-    def _initialize_exchange(self) -> None:
-        try:
-            exchange_options = {
-                "apiKey": self.api_key,
-                "secret": self.secret_key,
-                "enableRateLimit": True,
-            }
-
-            # --- FIXED: Inject password if available (Critical for OKX/KuCoin) ---
-            if self.password:
-                exchange_options["password"] = self.password
-
-            exchange = getattr(ccxtpro, self.exchange_name)(exchange_options)
-
-            if self.is_paper_trading_activated:
-                self._enable_sandbox_mode(exchange)
-            return exchange
-        except AttributeError:
-            raise UnsupportedExchangeError(f"The exchange '{self.exchange_name}' is not supported.") from None
-
-    def _enable_sandbox_mode(self, exchange) -> None:
-        if self.exchange_name == "binance":
-            exchange.urls["api"] = "https://testnet.binance.vision/api"
-        elif self.exchange_name == "kraken":
-            exchange.urls["api"] = "https://api.demo-futures.kraken.com"
-        elif self.exchange_name == "bitmex":
-            exchange.urls["api"] = "https://testnet.bitmex.com"
-        elif self.exchange_name == "bybit":
-            exchange.set_sandbox_mode(True)
-        # --- ADD THIS BLOCK FOR OKX ---
-        elif self.exchange_name == "okx":
-             exchange.set_sandbox_mode(True)  
-        # ------------------------------
-        else:
-            self.logger.warning(f"No sandbox mode available for {self.exchange_name}. Running in live mode.")
-
-    async def _subscribe_to_ticker_updates(
+class GridTradingBot:
+    def __init__(
         self,
-        pair: str,
-        on_ticker_update: Callable[[float], None],
-        update_interval: float,
-        max_retries: int = 5,
-    ) -> None:
-        self.connection_active = True
-        retry_count = 0
+        config_path: str,
+        config_manager: ConfigManager,
+        notification_handler: NotificationHandler,
+        event_bus: EventBus,
+        save_performance_results_path: str | None = None,
+        no_plot: bool = False,
+        bot_id: int | None = None,
+    ):
+        try:
+            self.bot_id = bot_id
+            self.logger = logging.getLogger(self.__class__.__name__)
+            self.config_path = config_path
+            self.config_manager = config_manager
+            self.notification_handler = notification_handler
+            self.event_bus = event_bus
+            self.event_bus.subscribe(Events.STOP_BOT, self._handle_stop_bot_event)
+            self.event_bus.subscribe(Events.START_BOT, self._handle_start_bot_event)
+            self.save_performance_results_path = save_performance_results_path
+            self.no_plot = no_plot
+            self.trading_mode: TradingMode = self.config_manager.get_trading_mode()
+            base_currency: str = self.config_manager.get_base_currency()
+            quote_currency: str = self.config_manager.get_quote_currency()
 
-        while self.connection_active:
+            self.trading_pair = f"{base_currency}/{quote_currency}"
+
+            strategy_type: StrategyType = self.config_manager.get_strategy_type()
+            self.logger.info(
+                f"Starting Grid Trading Bot in {self.trading_mode.value} mode with strategy: {strategy_type.value}",
+            )
+            self.is_running = False
+
+            # --- FIX: Track the background task ---
+            self.integrity_task = None
+            # --------------------------------------
+
+            self.exchange_service = ExchangeServiceFactory.create_exchange_service(
+                self.config_manager,
+                self.trading_mode,
+            )
+            order_execution_strategy = OrderExecutionStrategyFactory.create(self.config_manager, self.exchange_service)
+            grid_manager = GridManager(self.config_manager, strategy_type)
+            order_validator = OrderValidator()
+            fee_calculator = FeeCalculator(self.config_manager)
+
+            self.balance_tracker = BalanceTracker(
+                event_bus=self.event_bus,
+                fee_calculator=fee_calculator,
+                trading_mode=self.trading_mode,
+                base_currency=base_currency,
+                quote_currency=quote_currency,
+            )
+            order_book = OrderBook()
+
+            self.order_status_tracker = OrderStatusTracker(
+                order_book=order_book,
+                order_execution_strategy=order_execution_strategy,
+                event_bus=self.event_bus,
+                polling_interval=5.0,
+            )
+
+            order_manager = OrderManager(
+                grid_manager,
+                order_validator,
+                self.balance_tracker,
+                order_book,
+                self.event_bus,
+                order_execution_strategy,
+                self.notification_handler,
+                self.trading_mode,
+                self.trading_pair,
+                strategy_type,
+                self.bot_id,
+            )
+
+            trading_performance_analyzer = TradingPerformanceAnalyzer(self.config_manager, order_book)
+            plotter = Plotter(grid_manager, order_book) if self.trading_mode == TradingMode.BACKTEST else None
+            self.strategy = GridTradingStrategy(
+                self.config_manager,
+                self.event_bus,
+                self.exchange_service,
+                grid_manager,
+                order_manager,
+                self.balance_tracker,
+                trading_performance_analyzer,
+                self.trading_mode,
+                self.trading_pair,
+                plotter,
+            )
+
+        except (UnsupportedExchangeError, DataFetchError, UnsupportedTimeframeError) as e:
+            self.logger.error(f"{type(e).__name__}: {e}")
+            raise
+
+        except Exception:
+            self.logger.error("An unexpected error occurred.")
+            self.logger.error(traceback.format_exc())
+            raise
+
+    async def run(self) -> dict[str, Any] | None:
+        try:
+            self.is_running = True
+            investment_amount = self.config_manager.get_initial_balance()
+
+            await self.balance_tracker.setup_balances(
+                initial_balance=investment_amount,
+                initial_crypto_balance=0.0,
+                exchange_service=self.exchange_service,
+            )
+
+            self.order_status_tracker.start_tracking()
+            self.strategy.initialize_strategy()
+
+            # --- FIX: Store the task in self.integrity_task ---
+            if self.trading_mode in {TradingMode.LIVE, TradingMode.PAPER_TRADING}:
+                self.integrity_task = asyncio.create_task(self._start_integrity_loop())
+            # --------------------------------------------------
+
+            await self.strategy.run()
+
+            if not self.no_plot:
+                self.strategy.plot_results()
+
+            return self._generate_and_log_performance()
+
+        except Exception as e:
+            self.logger.error(f"An unexpected error occurred {e}")
+            self.logger.error(traceback.format_exc())
+            raise
+
+        finally:
+            self.is_running = False
+            # Ensure task is cancelled if we exit via exception
+            if self.integrity_task and not self.integrity_task.done():
+                self.integrity_task.cancel()
+
+    async def _handle_stop_bot_event(self, reason: str) -> None:
+        self.logger.info(f"Handling STOP_BOT event: {reason}")
+        await self._stop()
+
+    async def _handle_start_bot_event(self, reason: str) -> None:
+        self.logger.info(f"Handling START_BOT event: {reason}")
+        await self.restart()
+
+    async def _stop(self, sell_assets: bool = False) -> None:
+        if not self.is_running:
+            self.logger.info("Bot is not running. Nothing to stop.")
+            return
+
+        self.logger.info("Stopping Grid Trading Bot...")
+
+        try:
+            # --- FIX: Kill the Integrity Watchdog FIRST ---
+            if self.integrity_task:
+                self.integrity_task.cancel()
+                try:
+                    await self.integrity_task
+                except asyncio.CancelledError:
+                    self.logger.info("Integrity Watchdog task cancelled.")
+                self.integrity_task = None
+            # ----------------------------------------------
+
+            self.is_running = False
+            await self.order_status_tracker.stop_tracking()
+
+            # Cancel orders (Clean up exchange)
+            # Safe because OrderManager checks DB for ownership
+            await self.strategy.order_manager.cancel_all_open_orders()
+
+            await self.strategy.stop(sell_assets=sell_assets)
+
+        except Exception as e:
+            self.logger.error(f"Error while stopping components: {e}", exc_info=True)
+
+        self.logger.info("Grid Trading Bot has been stopped.")
+
+    async def restart(self) -> None:
+        if self.is_running:
+            self.logger.info("Bot is already running. Restarting...")
+            await self._stop()
+
+        self.logger.info("Restarting Grid Trading Bot...")
+        self.is_running = True
+
+        try:
+            self.order_status_tracker.start_tracking()
+            await self.strategy.restart()
+
+            # Restart integrity check if needed
+            if self.trading_mode in {TradingMode.LIVE, TradingMode.PAPER_TRADING}:
+                self.integrity_task = asyncio.create_task(self._start_integrity_loop())
+
+        except Exception as e:
+            self.logger.error(f"Error while restarting components: {e}", exc_info=True)
+
+        self.logger.info("Grid Trading Bot has been restarted.")
+
+    def _generate_and_log_performance(self) -> dict[str, Any] | None:
+        performance_summary, formatted_orders = self.strategy.generate_performance_report()
+        return {
+            "config": self.config_path,
+            "performance_summary": performance_summary,
+            "orders": formatted_orders,
+        }
+
+    async def get_bot_health_status(self) -> dict:
+        health_status = {
+            "strategy": await self._check_strategy_health(),
+            "exchange_status": await self._get_exchange_status(),
+        }
+
+        health_status["overall"] = all(health_status.values())
+        return health_status
+
+    async def _check_strategy_health(self) -> bool:
+        if not self.is_running:
+            self.logger.warning("Bot has stopped unexpectedly.")
+            return False
+        return True
+
+    async def _get_exchange_status(self) -> str:
+        exchange_status = await self.exchange_service.get_exchange_status()
+        return exchange_status.get("status", "unknown")
+
+    async def _start_integrity_loop(self):
+        self.logger.info("🛡️ Starting Grid Integrity Watchdog (5s interval)...")
+        # Initial delay to let startup complete
+        await asyncio.sleep(5)
+
+        while self.is_running:
             try:
-                ticker = await self.exchange.watch_ticker(pair)
-                current_price: float = ticker["last"]
-                if not self.connection_active:
-                    break
+                # Check price and reconcile
+                current_price = await self.exchange_service.get_current_price(self.trading_pair)
+                await self.strategy.order_manager.reconcile_grid_orders(current_price)
 
-                await on_ticker_update(current_price)
-                await asyncio.sleep(update_interval)
-                retry_count = 0  # Reset retry count after a successful operation
-
-            except (NetworkError, ExchangeError) as e:
-                retry_count += 1
-                retry_interval = min(retry_count * 5, 60)
-                self.logger.error(
-                    f"Error connecting to WebSocket for {pair}: {e}. "
-                    f"Retrying in {retry_interval} seconds ({retry_count}/{max_retries}).",
-                )
-
-                if retry_count >= max_retries:
-                    self.logger.error("Max retries reached. Stopping WebSocket connection.")
-                    self.connection_active = False
-                    break
-
-                await asyncio.sleep(retry_interval)
-
+                # Wait 5 seconds
+                await asyncio.sleep(5)
             except asyncio.CancelledError:
-                self.logger.error(f"WebSocket subscription for {pair} was cancelled.")
-                self.connection_active = False
+                self.logger.info("Integrity Loop Cancelled.")
                 break
-
             except Exception as e:
-                self.logger.error(f"WebSocket connection error: {e}. Reconnecting...")
+                self.logger.error(f"Integrity check failed: {e}")
+                # Wait before retrying to avoid spamming logs on persistent error
                 await asyncio.sleep(5)
 
-            finally:
-                if not self.connection_active:
-                    try:
-                        self.logger.info("Connection to Websocket no longer active.")
-                        await self.exchange.close()
-
-                    except Exception as e:
-                        self.logger.error(f"Error while closing WebSocket connection: {e}", exc_info=True)
-
-    async def listen_to_ticker_updates(
-        self,
-        pair: str,
-        on_price_update: Callable[[float], None],
-        update_interval: float,
-    ) -> None:
-        await self._subscribe_to_ticker_updates(pair, on_price_update, update_interval)
-
-    async def close_connection(self) -> None:
-        self.connection_active = False
-        self.logger.info("Closing WebSocket connection...")
-
-    async def get_balance(self) -> dict[str, Any]:
-        try:
-            balance = await self.exchange.fetch_balance()
-            return balance
-
-        except BaseError as e:
-            raise DataFetchError(f"Error fetching balance: {e!s}") from e
-
-    async def get_current_price(self, pair: str) -> float:
-        try:
-            ticker = await self.exchange.fetch_ticker(pair)
-            return ticker["last"]
-
-        except BaseError as e:
-            raise DataFetchError(f"Error fetching current price: {e!s}") from e
-
-    async def place_order(
-        self,
-        pair: str,
-        order_type: str,
-        order_side: str,
-        amount: float,
-        price: float | None = None,
-    ) -> dict[str, str | float]:
-        try:
-            order = await self.exchange.create_order(pair, order_type, order_side, amount, price)
-            return order
-
-        except NetworkError as e:
-            raise DataFetchError(f"Network issue occurred while placing order: {e!s}") from e
-
-        except BaseError as e:
-            raise DataFetchError(f"Error placing order: {e!s}") from e
-
-        except Exception as e:
-            raise DataFetchError(f"Unexpected error placing order: {e!s}") from e
-
-    async def fetch_order(
-        self,
-        order_id: str,
-        pair: str,
-    ) -> dict[str, str | float]:
-        try:
-            return await self.exchange.fetch_order(order_id, pair)
-
-        except NetworkError as e:
-            raise DataFetchError(f"Network issue occurred while fetching order status: {e!s}") from e
-
-        except BaseError as e:
-            raise DataFetchError(f"Exchange-specific error occurred: {e!s}") from e
-
-        except Exception as e:
-            raise DataFetchError(f"Failed to fetch order status: {e!s}") from e
-
-    async def cancel_order(
-        self,
-        order_id: str,
-        pair: str,
-    ) -> dict:
-        try:
-            self.logger.info(f"Attempting to cancel order {order_id} for pair {pair}")
-            cancellation_result = await self.exchange.cancel_order(order_id, pair)
-
-            if cancellation_result["status"] in ["canceled", "closed"]:
-                self.logger.info(f"Order {order_id} successfully canceled.")
-                return cancellation_result
-            else:
-                self.logger.warning(f"Order {order_id} cancellation status: {cancellation_result['status']}")
-                return cancellation_result
-
-        except OrderNotFound:
-            raise OrderCancellationError(
-                f"Order {order_id} not found for cancellation. It may already be completed or canceled.",
-            ) from None
-
-        except NetworkError as e:
-            raise OrderCancellationError(f"Network error while canceling order {order_id}: {e!s}") from e
-
-        except BaseError as e:
-            raise OrderCancellationError(f"Exchange error while canceling order {order_id}: {e!s}") from e
-
-        except Exception as e:
-            raise OrderCancellationError(f"Unexpected error while canceling order {order_id}: {e!s}") from e
-
-    async def get_exchange_status(self) -> dict:
-        try:
-            status = await self.exchange.fetch_status()
-            return {
-                "status": status.get("status", "unknown"),
-                "updated": status.get("updated"),
-                "eta": status.get("eta"),
-                "url": status.get("url"),
-                "info": status.get("info", "No additional info available"),
-            }
-
-        except AttributeError:
-            return {"status": "unsupported", "info": "fetch_status not supported by this exchange."}
-
-        except Exception as e:
-            return {"status": "error", "info": f"Failed to fetch exchange status: {e}"}
-
-    def fetch_ohlcv(
-        self,
-        pair: str,
-        timeframe: str,
-        start_date: str,
-        end_date: str,
-    ) -> pd.DataFrame:
-        raise NotImplementedError("fetch_ohlcv is not used in live or paper trading mode.")
+    def get_balances(self) -> dict[str, float]:
+        return {
+            "fiat": self.balance_tracker.balance,
+            "reserved_fiat": self.balance_tracker.reserved_fiat,
+            "crypto": self.balance_tracker.crypto_balance,
+            "reserved_crypto": self.balance_tracker.reserved_crypto,
+        }
