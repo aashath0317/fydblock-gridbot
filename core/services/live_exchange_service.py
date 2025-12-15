@@ -26,9 +26,13 @@ class LiveExchangeService(ExchangeInterface):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.exchange_name = self.config_manager.get_exchange_name()
         
+        # --- FIXED: Use getattr to safely get keys from config adapter ---
         self.api_key = getattr(config_manager, "get_api_key", lambda: None)() or os.getenv("EXCHANGE_API_KEY")
         self.secret_key = getattr(config_manager, "get_api_secret", lambda: None)() or os.getenv("EXCHANGE_SECRET_KEY")
         
+        # --- FIXED: Added retrieval of password ---
+        self.password = getattr(config_manager, "get_api_password", lambda: None)() or os.getenv("EXCHANGE_PASSWORD")
+
         if not self.api_key or not self.secret_key:
              raise MissingEnvironmentVariableError("API Key or Secret missing.")
 
@@ -43,13 +47,17 @@ class LiveExchangeService(ExchangeInterface):
 
     def _initialize_exchange(self) -> None:
         try:
-            exchange = getattr(ccxtpro, self.exchange_name)(
-                {
-                    "apiKey": self.api_key,
-                    "secret": self.secret_key,
-                    "enableRateLimit": True,
-                },
-            )
+            exchange_options = {
+                "apiKey": self.api_key,
+                "secret": self.secret_key,
+                "enableRateLimit": True,
+            }
+
+            # --- FIXED: Inject password if available (Critical for OKX/KuCoin) ---
+            if self.password:
+                exchange_options["password"] = self.password
+
+            exchange = getattr(ccxtpro, self.exchange_name)(exchange_options)
 
             if self.is_paper_trading_activated:
                 self._enable_sandbox_mode(exchange)
@@ -66,6 +74,10 @@ class LiveExchangeService(ExchangeInterface):
             exchange.urls["api"] = "https://testnet.bitmex.com"
         elif self.exchange_name == "bybit":
             exchange.set_sandbox_mode(True)
+        # --- ADD THIS BLOCK FOR OKX ---
+        elif self.exchange_name == "okx":
+             exchange.set_sandbox_mode(True)  
+        # ------------------------------
         else:
             self.logger.warning(f"No sandbox mode available for {self.exchange_name}. Running in live mode.")
 
@@ -83,8 +95,6 @@ class LiveExchangeService(ExchangeInterface):
             try:
                 ticker = await self.exchange.watch_ticker(pair)
                 current_price: float = ticker["last"]
-                self.logger.info(f"Connected to WebSocket for {pair} ticker current price: {current_price}")
-
                 if not self.connection_active:
                     break
 
