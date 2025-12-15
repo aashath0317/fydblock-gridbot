@@ -1,4 +1,5 @@
 import logging
+
 import numpy as np
 import pandas as pd
 
@@ -11,11 +12,13 @@ from core.order_handling.order_manager import OrderManager
 from core.services.exchange_interface import ExchangeInterface
 from strategies.plotter import Plotter
 from strategies.trading_performance_analyzer import TradingPerformanceAnalyzer
+
 from .trading_strategy_interface import TradingStrategyInterface
+
 
 class GridTradingStrategy(TradingStrategyInterface):
     # Set to 0 for Real-Time WebSocket streaming
-    TICKER_REFRESH_INTERVAL = 0  
+    TICKER_REFRESH_INTERVAL = 0
 
     def __init__(
         self,
@@ -65,22 +68,34 @@ class GridTradingStrategy(TradingStrategyInterface):
 
     async def stop(self, sell_assets: bool = False):
         self._running = False
-        
+
         if sell_assets and self.trading_mode != TradingMode.BACKTEST:
             self.logger.info("?? Emergency stop triggered: Cancelling orders and liquidating assets.")
             try:
                 # 1. Get current price for liquidation estimate
                 current_price = await self.exchange_service.get_current_price(self.trading_pair)
-                
-                # 2. Cancel all pending grid orders
-                await self.order_manager.cancel_all_open_orders()
-                
-                # 3. Sell everything to USDT
-                await self.order_manager.liquidate_positions(current_price)
-                
-            except Exception as e:
-                self.logger.error(f"Error during emergency cleanup: {e}")
 
+                # 2. Cancel all pending grid orders (Releases locked funds)
+                await self.order_manager.cancel_all_open_orders()
+
+                # 3. SYNC BALANCE (Crucial Fix)
+                # Fetch fresh balances from exchange to account for fees/dust drift
+                balances = await self.exchange_service.get_balance()
+                base_currency = self.trading_pair.split("/")[0]  # e.g., 'SOL'
+
+                actual_crypto = float(balances.get(base_currency, {}).get("free", 0.0))
+
+                # Update the tracker with the REAL amount to sell
+                self.balance_tracker.crypto_balance = actual_crypto
+                self.logger.info(f"?? Balance Synced for Liquidation: {actual_crypto} {base_currency}")
+
+                # 4. Sell everything to Quote Currency
+                await self.order_manager.liquidate_positions(current_price)
+
+            except Exception as e:
+                self.logger.error(f"Error during emergency cleanup: {e}", exc_info=True)
+
+        # Close connection only after operations are done
         await self.exchange_service.close_connection()
         self.logger.info("Trading execution stopped.")
 
@@ -102,17 +117,17 @@ class GridTradingStrategy(TradingStrategyInterface):
 
     async def _run_live_or_paper_trading(self, trigger_price: float):
         self.logger.info(f"Starting {'live' if self.trading_mode == TradingMode.LIVE else 'paper'} trading")
-        
+
         # --- MODIFIED BALANCE SYNC LOGIC ---
         self.logger.info("?? Synchronizing Wallet Balances with Exchange...")
         try:
             balances = await self.exchange_service.get_balance()
-            base_currency, quote_currency = self.trading_pair.split('/')
-            
+            base_currency, quote_currency = self.trading_pair.split("/")
+
             # 1. Get Actual Wallet Balances
-            actual_crypto_balance = float(balances.get(base_currency, {}).get('free', 0.0))
-            actual_fiat_balance = float(balances.get(quote_currency, {}).get('free', 0.0))
-            
+            actual_crypto_balance = float(balances.get(base_currency, {}).get("free", 0.0))
+            actual_fiat_balance = float(balances.get(quote_currency, {}).get("free", 0.0))
+
             # 2. Get User's Investment Limit
             investment_amount = self.config_manager.get_investment_amount()
             self.logger.info(f"   ?? Wallet Has: {actual_fiat_balance} {quote_currency}")
@@ -130,20 +145,20 @@ class GridTradingStrategy(TradingStrategyInterface):
             # 4. Cap the Bot's Balance to the Investment Amount
             # We ignore any extra money in the wallet so the bot doesn't touch it.
             effective_fiat_balance = investment_amount
-            
-            # NOTE: For safety, we usually start with 0 crypto in the bot's internal tracker 
-            # unless we specifically want to use existing bags. 
+
+            # NOTE: For safety, we usually start with 0 crypto in the bot's internal tracker
+            # unless we specifically want to use existing bags.
             # Here we pass the wallet's crypto, but the bot will primarily use the allocated USDT.
             effective_crypto_balance = actual_crypto_balance
 
-            self.logger.info(f"   ? Bot Initialized with: {effective_fiat_balance} {quote_currency} (Capped at investment)")
+            self.logger.info(
+                f"   ? Bot Initialized with: {effective_fiat_balance} {quote_currency} (Capped at investment)"
+            )
 
             res = self.balance_tracker.setup_balances(
-                effective_fiat_balance, 
-                effective_crypto_balance, 
-                self.exchange_service
+                effective_fiat_balance, effective_crypto_balance, self.exchange_service
             )
-            if res is not None and hasattr(res, '__await__'):
+            if res is not None and hasattr(res, "__await__"):
                 await res
 
         except Exception as e:
@@ -205,9 +220,7 @@ class GridTradingStrategy(TradingStrategyInterface):
         if grid_orders_initialized:
             return True
 
-        self.logger.info(
-            f"?? Immediate Start Triggered! Current Price: {current_price} (Grid Center: {trigger_price})"
-        )
+        self.logger.info(f"?? Immediate Start Triggered! Current Price: {current_price} (Grid Center: {trigger_price})")
 
         self.logger.info("?? Cleaning up any existing open orders before start...")
         try:
@@ -222,7 +235,7 @@ class GridTradingStrategy(TradingStrategyInterface):
             self.logger.info("Initial purchase complete. Placing grid orders...")
             await self.order_manager.initialize_grid_orders(current_price)
             return True
-            
+
         except Exception as e:
             self.logger.error(f"?? CRITICAL: Initialization Failed. Stopping Strategy. Error: {e}")
             self._running = False
@@ -238,32 +251,58 @@ class GridTradingStrategy(TradingStrategyInterface):
         high_prices = self.data["high"].values
         low_prices = self.data["low"].values
         timestamps = self.data.index
-        self.data.loc[timestamps[0], "account_value"] = self.balance_tracker.get_total_balance_value(price=self.close_prices[0])
+        self.data.loc[timestamps[0], "account_value"] = self.balance_tracker.get_total_balance_value(
+            price=self.close_prices[0]
+        )
         grid_orders_initialized = False
         last_price = None
-        for i, (current_price, high_price, low_price, timestamp) in enumerate(zip(self.close_prices, high_prices, low_prices, timestamps, strict=False)):
-            grid_orders_initialized = await self._initialize_grid_orders_once(current_price, trigger_price, grid_orders_initialized, last_price)
+        for i, (current_price, high_price, low_price, timestamp) in enumerate(
+            zip(self.close_prices, high_prices, low_prices, timestamps, strict=False)
+        ):
+            grid_orders_initialized = await self._initialize_grid_orders_once(
+                current_price, trigger_price, grid_orders_initialized, last_price
+            )
             if not grid_orders_initialized:
-                self.data.loc[timestamps[i], "account_value"] = self.balance_tracker.get_total_balance_value(price=current_price)
+                self.data.loc[timestamps[i], "account_value"] = self.balance_tracker.get_total_balance_value(
+                    price=current_price
+                )
                 last_price = current_price
                 continue
             await self.order_manager.simulate_order_fills(high_price, low_price, timestamp)
-            if await self._handle_take_profit_stop_loss(current_price): break
+            if await self._handle_take_profit_stop_loss(current_price):
+                break
             self.data.loc[timestamp, "account_value"] = self.balance_tracker.get_total_balance_value(current_price)
             last_price = current_price
 
     def generate_performance_report(self) -> tuple[dict, list]:
         if self.trading_mode == TradingMode.BACKTEST:
-            return self.trading_performance_analyzer.generate_performance_summary(self.data, self.close_prices[0], self.balance_tracker.get_adjusted_fiat_balance(), self.balance_tracker.get_adjusted_crypto_balance(), self.close_prices[-1], self.balance_tracker.total_fees)
+            return self.trading_performance_analyzer.generate_performance_summary(
+                self.data,
+                self.close_prices[0],
+                self.balance_tracker.get_adjusted_fiat_balance(),
+                self.balance_tracker.get_adjusted_crypto_balance(),
+                self.close_prices[-1],
+                self.balance_tracker.total_fees,
+            )
         else:
-            if not self.live_trading_metrics: return {}, []
+            if not self.live_trading_metrics:
+                return {}, []
             live_data = pd.DataFrame(self.live_trading_metrics, columns=["timestamp", "account_value", "price"])
             live_data.set_index("timestamp", inplace=True)
-            return self.trading_performance_analyzer.generate_performance_summary(live_data, live_data.iloc[0]["price"], self.balance_tracker.get_adjusted_fiat_balance(), self.balance_tracker.get_adjusted_crypto_balance(), live_data.iloc[-1]["price"], self.balance_tracker.total_fees)
+            return self.trading_performance_analyzer.generate_performance_summary(
+                live_data,
+                live_data.iloc[0]["price"],
+                self.balance_tracker.get_adjusted_fiat_balance(),
+                self.balance_tracker.get_adjusted_crypto_balance(),
+                live_data.iloc[-1]["price"],
+                self.balance_tracker.total_fees,
+            )
 
     def plot_results(self) -> None:
-        if self.trading_mode == TradingMode.BACKTEST: self.plotter.plot_results(self.data)
-        else: self.logger.info("Plotting is not available for live/paper trading mode.")
+        if self.trading_mode == TradingMode.BACKTEST:
+            self.plotter.plot_results(self.data)
+        else:
+            self.logger.info("Plotting is not available for live/paper trading mode.")
 
     async def _handle_take_profit_stop_loss(self, current_price: float) -> bool:
         if await self._evaluate_tp_or_sl(current_price):
@@ -273,20 +312,31 @@ class GridTradingStrategy(TradingStrategyInterface):
         return False
 
     async def _evaluate_tp_or_sl(self, current_price: float) -> bool:
-        if self.balance_tracker.crypto_balance == 0: return False
+        if self.balance_tracker.crypto_balance == 0:
+            return False
         return await self._handle_take_profit(current_price) or await self._handle_stop_loss(current_price)
 
     async def _handle_take_profit(self, current_price: float) -> bool:
-        if self.config_manager.is_take_profit_enabled() and current_price >= self.config_manager.get_take_profit_threshold():
+        if (
+            self.config_manager.is_take_profit_enabled()
+            and current_price >= self.config_manager.get_take_profit_threshold()
+        ):
             self.logger.info(f"Take-profit triggered at {current_price}. Executing TP order...")
-            await self.order_manager.execute_take_profit_or_stop_loss_order(current_price=current_price, take_profit_order=True)
+            await self.order_manager.execute_take_profit_or_stop_loss_order(
+                current_price=current_price, take_profit_order=True
+            )
             return True
         return False
 
     async def _handle_stop_loss(self, current_price: float) -> bool:
-        if self.config_manager.is_stop_loss_enabled() and current_price <= self.config_manager.get_stop_loss_threshold():
+        if (
+            self.config_manager.is_stop_loss_enabled()
+            and current_price <= self.config_manager.get_stop_loss_threshold()
+        ):
             self.logger.info(f"Stop-loss triggered at {current_price}. Executing SL order...")
-            await self.order_manager.execute_take_profit_or_stop_loss_order(current_price=current_price, stop_loss_order=True)
+            await self.order_manager.execute_take_profit_or_stop_loss_order(
+                current_price=current_price, stop_loss_order=True
+            )
             return True
         return False
 
