@@ -3,6 +3,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+from contextlib import asynccontextmanager
 
 # --- Import Core Modules ---
 from core.bot_management.grid_trading_bot import GridTradingBot
@@ -15,8 +16,6 @@ from adapter.config_adapter import DictConfigManager
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("FydEngine")
 
-app = FastAPI()
-
 # Store active bots: { bot_id: { "bot": GridTradingBot, "task": asyncio.Task } }
 active_instances: Dict[int, Dict[str, Any]] = {}
 
@@ -25,8 +24,9 @@ class StrategyConfig(BaseModel):
     upper_price: float
     lower_price: float
     grids: int
-    investment: float
     spacing: Optional[str] = "geometric"
+    # Optional fallback for compatibility
+    investment: Optional[float] = None 
 
 class BotRequest(BaseModel):
     bot_id: int
@@ -35,8 +35,11 @@ class BotRequest(BaseModel):
     pair: str
     api_key: str
     api_secret: str
-    mode: str = "live"  # live, paper
+    passphrase: Optional[str] = None
+    mode: str = "live"
     strategy: StrategyConfig
+    # Primary location for investment
+    investment: float = 0.0 
 
 class BacktestRequest(BaseModel):
     exchange: str
@@ -50,7 +53,7 @@ class BacktestRequest(BaseModel):
     timeframe: str = "1h"
 
 # --- Helper: Map Request to Bot Config ---
-def create_config(exchange, pair, api_key, api_secret, mode, strategy_settings, trading_settings):
+def create_config(exchange, pair, api_key, api_secret, passphrase, mode, strategy_settings, trading_settings):
     base, quote = pair.split('/')
     return {
         "exchange": {
@@ -60,13 +63,18 @@ def create_config(exchange, pair, api_key, api_secret, mode, strategy_settings, 
         },
         "credentials": {
             "api_key": api_key,
-            "api_secret": api_secret
+            "api_secret": api_secret,
+            "password": passphrase 
         },
         "pair": {
             "base_currency": base,
             "quote_currency": quote
         },
         "trading_settings": trading_settings,
+        
+        # Inject investment at root for ConfigManager
+        "investment": trading_settings.get("initial_balance", 0.0),
+        
         "grid_strategy": {
             "type": "simple_grid",
             "spacing": strategy_settings.get('spacing', 'geometric'),
@@ -74,17 +82,42 @@ def create_config(exchange, pair, api_key, api_secret, mode, strategy_settings, 
             "range": {
                 "top": strategy_settings['upper_price'],
                 "bottom": strategy_settings['lower_price']
-            }
+            },
+            # Also inject here for safety
+            "investment": trading_settings.get("initial_balance", 0.0)
         },
         "risk_management": {
-            "take_profit": {"enabled": False},
-            "stop_loss": {"enabled": False}
+            "take_profit": {
+                "enabled": False,
+                "threshold": 0.0
+            },
+            "stop_loss": {
+                "enabled": False,
+                "threshold": 0.0
+            }
         },
         "logging": {
             "log_level": "INFO",
             "log_to_file": False
         }
     }
+
+# --- Lifecycle Management ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    logger.info("?? Server shutting down. Cleaning up active bots...")
+    tasks = []
+    for bot_id, instance in active_instances.items():
+        bot = instance["bot"]
+        logger.info(f"Stopping Bot {bot_id} and liquidating assets...")
+        tasks.append(bot._stop(sell_assets=True))
+    
+    if tasks:
+        await asyncio.gather(*tasks)
+    logger.info("All bots stopped and assets liquidated.")
+
+app = FastAPI(lifespan=lifespan)
 
 # --- API Endpoints ---
 
@@ -97,10 +130,25 @@ async def start_bot(req: BotRequest):
     if req.bot_id in active_instances:
         raise HTTPException(status_code=400, detail="Bot already running")
 
-    # Prepare Config
+    # --- 1. RESOLVE INVESTMENT AMOUNT ---
+    final_investment = req.investment
+    
+    # Fallback: If root investment is 0, check inside strategy (backward compatibility)
+    if final_investment == 0 and req.strategy.investment is not None:
+        final_investment = req.strategy.investment
+
+    logger.info(f"?? Starting Bot {req.bot_id} | Investment: {final_investment} USDT")
+
+    # --- 2. Prepare Config ---
     trading_settings = {
-        "initial_balance": req.strategy.investment,
-        "timeframe": "1m"
+        "initial_balance": final_investment, 
+        "investment": final_investment, 
+        "timeframe": "1m",
+        "period": {
+            "start_date": "2024-01-01T00:00:00Z", 
+            "end_date": "2070-01-01T00:00:00Z"
+        },
+        "historical_data_file": None
     }
     
     strategy_settings = {
@@ -113,16 +161,17 @@ async def start_bot(req: BotRequest):
     mode_str = "paper_trading" if req.mode == 'paper' else "live"
     
     config_dict = create_config(
-        req.exchange, req.pair, req.api_key, req.api_secret, 
+        req.exchange, req.pair, req.api_key, req.api_secret, req.passphrase,
         mode_str, strategy_settings, trading_settings
     )
 
     try:
         # Initialize Components
         validator = ConfigValidator()
+        # This will fail if initial_balance is missing or invalid
         config_manager = DictConfigManager(config_dict, validator)
+        
         event_bus = EventBus()
-        # Live bots might need notifications, passed as None for now (can be expanded later)
         notification_handler = NotificationHandler(event_bus, None, config_manager.get_trading_mode())
 
         bot = GridTradingBot(
@@ -133,7 +182,6 @@ async def start_bot(req: BotRequest):
             no_plot=True
         )
 
-        # Start Async Task
         task = asyncio.create_task(bot.run())
         
         active_instances[req.bot_id] = {
@@ -142,7 +190,6 @@ async def start_bot(req: BotRequest):
             "event_bus": event_bus
         }
 
-        logger.info(f"Bot {req.bot_id} started successfully.")
         return {"status": "started", "bot_id": req.bot_id}
 
     except Exception as e:
@@ -157,10 +204,8 @@ async def stop_bot(bot_id: int):
     instance = active_instances[bot_id]
     bot = instance["bot"]
     
-    # Graceful Shutdown
-    await bot._stop()
+    await bot._stop(sell_assets=True)
     
-    # Wait for the background task to finish
     try:
         await asyncio.wait_for(instance["task"], timeout=5.0)
     except asyncio.TimeoutError:
@@ -173,19 +218,12 @@ async def stop_bot(bot_id: int):
 
 @app.post("/backtest")
 async def run_backtest(req: BacktestRequest):
-    """
-    Executes a backtest by initializing a GridTradingBot in 'backtest' mode.
-    """
     try:
-        # 1. Prepare Configuration
         trading_settings = {
             "initial_balance": req.capital,
+            "investment": req.capital,
             "timeframe": req.timeframe,
-            "period": {
-                "start_date": req.startDate,
-                "end_date": req.endDate
-            },
-            # historical_data_file must be None to force fetching from Exchange via CCXT
+            "period": { "start_date": req.startDate, "end_date": req.endDate },
             "historical_data_file": None 
         }
 
@@ -196,18 +234,14 @@ async def run_backtest(req: BacktestRequest):
             "spacing": "geometric"
         }
 
-        # API keys are passed as dummy values since backtesting primarily needs public data,
-        # but the bot structure requires them to be present.
         config_dict = create_config(
-            req.exchange, req.pair, "dummy_key", "dummy_secret", 
+            req.exchange, req.pair, "dummy_key", "dummy_secret", None,
             "backtest", strategy_settings, trading_settings
         )
 
-        # 2. Initialize Bot Components
         validator = ConfigValidator()
         config_manager = DictConfigManager(config_dict, validator)
         event_bus = EventBus()
-        # Notifications disabled for backtest
         notification_handler = NotificationHandler(event_bus, None, config_manager.get_trading_mode())
 
         bot = GridTradingBot(
@@ -215,13 +249,11 @@ async def run_backtest(req: BacktestRequest):
             config_manager=config_manager,
             notification_handler=notification_handler,
             event_bus=event_bus,
-            no_plot=True # Important: Disable plotting for API calls
+            no_plot=True
         )
 
-        # 3. Run Sync (Await the result directly)
         logger.info(f"Starting backtest for {req.pair}...")
         result = await bot.run()
-        
         return result
 
     except Exception as e:
