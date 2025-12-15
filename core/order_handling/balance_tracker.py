@@ -1,7 +1,7 @@
 import logging
 
 from config.trading_mode import TradingMode
-from core.bot_management.event_bus import EventBus, Events
+from core.bot_management.event_bus import EventBus
 from core.services.exchange_interface import ExchangeInterface
 
 from ..validation.exceptions import (
@@ -54,21 +54,14 @@ class BalanceTracker:
         exchange_service=ExchangeInterface,
     ):
         """
-        Sets up the balances based on trading mode.
-
-        For BACKTEST mode, sets initial balances.
-        For LIVE and PAPER_TRADING modes, fetches balances dynamically from the exchange.
-
-        Args:
-            initial_balance: The initial fiat balance for backtest mode.
-            initial_crypto_balance: The initial crypto balance for backtest mode.
-            exchange_service: The exchange instance (required for live and paper_trading trading).
+        Sets up the balances using the investment cap passed from the Strategy.
         """
-        if self.trading_mode == TradingMode.BACKTEST:
-            self.balance = initial_balance
-            self.crypto_balance = initial_crypto_balance
-        elif self.trading_mode == TradingMode.LIVE or self.trading_mode == TradingMode.PAPER_TRADING:
-            self.balance, self.crypto_balance = await self._fetch_live_balances(exchange_service)
+        self.balance = initial_balance
+        self.crypto_balance = initial_crypto_balance
+
+        self.logger.info(
+            f"Balance Tracker Initialized: {self.balance} {self.quote_currency} (Investment Cap) / {self.crypto_balance} {self.base_currency}"
+        )
 
     async def _fetch_live_balances(
         self,
@@ -219,7 +212,9 @@ class BalanceTracker:
             quantity: The quantity of crypto to reserve.
         """
         if self.crypto_balance < quantity:
-            raise InsufficientCryptoBalanceError(f"Insufficient crypto balance to reserve {quantity}. Available: {self.crypto_balance}")
+            raise InsufficientCryptoBalanceError(
+                f"Insufficient crypto balance to reserve {quantity}. Available: {self.crypto_balance}"
+            )
 
         self.reserved_crypto += quantity
         self.crypto_balance -= quantity
