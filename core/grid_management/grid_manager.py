@@ -251,15 +251,17 @@ class GridManager:
     ) -> bool:
         if self.strategy_type == StrategyType.SIMPLE_GRID:
             if order_side == OrderSide.BUY:
-                # 1. Self Check
+                # 1. Self Check: Must be ready to buy
                 if grid_level.state != GridCycleState.READY_TO_BUY:
                     return False
 
-                # 2. FIX: Check Neighbor (Paired Sell Level)
-                # If the level where we want to sell is busy, we cannot buy yet.
-                # This prevents "Grid Overlap" warnings and stuck bags.
+                # 2. NEIGHBOR CHECK (The Fix)
+                # Ensure the grid level ABOVE (where we would sell) is completely empty.
+                # If the level above is busy buying, selling, or holding a bag,
+                # we cannot buy here because we won't be able to place the sell order.
                 paired_sell = self.get_paired_sell_level(grid_level)
-                if paired_sell and paired_sell.state == GridCycleState.WAITING_FOR_SELL_FILL:
+                if paired_sell and paired_sell.state != GridCycleState.READY_TO_BUY:
+                    # If the neighbor is not empty, block this trade to prevent "Grid Overlap"
                     return False
 
                 return True
