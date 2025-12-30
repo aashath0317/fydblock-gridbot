@@ -197,3 +197,8 @@ class BacktestExchangeService(ExchangeInterface):
 
     async def close_connection(self) -> None:
         self.logger.info("[BACKTEST] Closing WebSocket connection...")
+
+    async def fetch_open_orders(self, pair: str) -> list[dict]:
+        # In backtesting, we don't fetch open orders from an 'exchange'.
+        # The OrderManager tracks simulated orders internally.
+        return []

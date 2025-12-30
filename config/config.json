@@ -2,7 +2,7 @@
   "exchange": {
     "name": "binance",
     "trading_fee": 0.001,
-    "trading_mode": "backtest"
+    "trading_mode": "paper"
   },
   "pair": {
     "base_currency": "SOL",

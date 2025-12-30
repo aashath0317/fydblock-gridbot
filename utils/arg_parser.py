@@ -51,9 +51,9 @@ def parse_and_validate_console_args(cli_args=None):
             "--config",
             type=str,
             nargs="+",
-            required=True,
+            required=False,
             metavar="CONFIG",
-            help="Path(s) to the configuration file(s) containing strategy details.",
+            help="Path(s) to the configuration file(s) containing strategy details. Defaults to config/config.json",
         )
 
         optional_args = parser.add_argument_group("Optional Arguments")
@@ -75,6 +75,27 @@ def parse_and_validate_console_args(cli_args=None):
         )
 
         args = parser.parse_args(cli_args)
+
+        # Default config if not provided
+        if not args.config:
+            default_config = "config/config.json"
+            if os.path.exists(default_config):
+                args.config = [default_config]
+            elif os.path.exists("config.json"):
+                args.config = ["config.json"]
+            else:
+                # If neither exists, we must fail, but nicely.
+                # Since we removed required=True, argparse won't fail automatically.
+                # check existence in validate_args or here.
+                # validate_args handles existence check, but we need to ensure args.config is not None/Empty to invoke it?
+                # Actually validate_args iterates `if args.config:`.
+                # If we leave it empty, it might run nothing?
+                # main.py does: `for config_path in args.config`. If empty, it runs nothing.
+                # So we should enforce it here.
+                raise ValueError(
+                    "No configuration file found. Please provide --config or ensure config/config.json exists."
+                )
+
         validate_args(args)
         return args
 

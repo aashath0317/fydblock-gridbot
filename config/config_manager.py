@@ -86,6 +86,29 @@ class ConfigManager:
         trading_settings = self.get_trading_settings()
         return trading_settings.get("initial_balance", 10000)
 
+    # --- ADDED: The missing method that caused the crash ---
+    def get_investment_amount(self) -> float:
+        """
+        Retrieves the total investment amount allocated for this bot.
+        Checks root level first, then inside 'trading_settings' or 'strategy'.
+        """
+        # 1. Check root level
+        val = self.config.get("investment")
+
+        # 2. Check inside trading_settings
+        if val is None:
+            val = self.get_trading_settings().get("investment")
+
+        # 3. Check inside grid_strategy (common fallback)
+        if val is None:
+            val = self.get_grid_settings().get("investment")
+
+        if val is None:
+            return 0.0
+        return float(val)
+
+    # -----------------------------------------------------
+
     def get_historical_data_file(self):
         trading_settings = self.get_trading_settings()
         return trading_settings.get("historical_data_file", None)

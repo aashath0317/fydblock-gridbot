@@ -25,12 +25,16 @@ class LiveExchangeService(ExchangeInterface):
         self.is_paper_trading_activated = is_paper_trading_activated
         self.logger = logging.getLogger(self.__class__.__name__)
         self.exchange_name = self.config_manager.get_exchange_name()
-        
+
+        # --- FIXED: Use getattr to safely get keys from config adapter ---
         self.api_key = getattr(config_manager, "get_api_key", lambda: None)() or os.getenv("EXCHANGE_API_KEY")
         self.secret_key = getattr(config_manager, "get_api_secret", lambda: None)() or os.getenv("EXCHANGE_SECRET_KEY")
-        
+
+        # --- FIXED: Added retrieval of password ---
+        self.password = getattr(config_manager, "get_api_password", lambda: None)() or os.getenv("EXCHANGE_PASSWORD")
+
         if not self.api_key or not self.secret_key:
-             raise MissingEnvironmentVariableError("API Key or Secret missing.")
+            raise MissingEnvironmentVariableError("API Key or Secret missing.")
 
         self.exchange = self._initialize_exchange()
         self.connection_active = False
@@ -43,13 +47,17 @@ class LiveExchangeService(ExchangeInterface):
 
     def _initialize_exchange(self) -> None:
         try:
-            exchange = getattr(ccxtpro, self.exchange_name)(
-                {
-                    "apiKey": self.api_key,
-                    "secret": self.secret_key,
-                    "enableRateLimit": True,
-                },
-            )
+            exchange_options = {
+                "apiKey": self.api_key,
+                "secret": self.secret_key,
+                "enableRateLimit": True,
+            }
+
+            # --- FIXED: Inject password if available (Critical for OKX/KuCoin) ---
+            if self.password:
+                exchange_options["password"] = self.password
+
+            exchange = getattr(ccxtpro, self.exchange_name)(exchange_options)
 
             if self.is_paper_trading_activated:
                 self._enable_sandbox_mode(exchange)
@@ -64,8 +72,9 @@ class LiveExchangeService(ExchangeInterface):
             exchange.urls["api"] = "https://api.demo-futures.kraken.com"
         elif self.exchange_name == "bitmex":
             exchange.urls["api"] = "https://testnet.bitmex.com"
-        elif self.exchange_name == "bybit":
+        elif self.exchange_name == "bybit" or self.exchange_name == "okx":
             exchange.set_sandbox_mode(True)
+        # ------------------------------
         else:
             self.logger.warning(f"No sandbox mode available for {self.exchange_name}. Running in live mode.")
 
@@ -83,8 +92,6 @@ class LiveExchangeService(ExchangeInterface):
             try:
                 ticker = await self.exchange.watch_ticker(pair)
                 current_price: float = ticker["last"]
-                self.logger.info(f"Connected to WebSocket for {pair} ticker current price: {current_price}")
-
                 if not self.connection_active:
                     break
 
@@ -237,6 +244,58 @@ class LiveExchangeService(ExchangeInterface):
 
         except Exception as e:
             return {"status": "error", "info": f"Failed to fetch exchange status: {e}"}
+
+    async def fetch_open_orders(self, pair: str) -> list[dict]:
+        if not self.exchange:
+            raise UnsupportedExchangeError("Exchange has not been initialized")
+
+        try:
+            all_orders = []
+            limit = 100  # OKX Max Limit per page
+            params = {}
+
+            while True:
+                # Use the last order ID as a cursor for the next page
+                if all_orders:
+                    # For OKX/CCXT, 'after' tells it to give orders starting AFTER this ID
+                    params["after"] = all_orders[-1]["id"]
+
+                # Fetch one batch
+                orders = await self.exchange.fetch_open_orders(symbol=pair, limit=limit, params=params)
+
+                # If we get nothing, we are done
+                if not orders:
+                    break
+
+                all_orders.extend(orders)
+
+                # If we got fewer than the limit, it means we reached the last page
+                if len(orders) < limit:
+                    break
+
+                # Safety break to prevent infinite loops (e.g. API bug)
+                if len(all_orders) > 2000:
+                    self.logger.warning("Fetched >2000 orders. Stopping pagination to prevent overflow.")
+                    break
+
+            # self.logger.info(f"Fetched total {len(all_orders)} open orders from exchange.") (Avoid Spamming)
+
+            return [
+                {
+                    "id": order["id"],
+                    "price": float(order["price"]),
+                    "amount": float(order["amount"]),
+                    "side": order["side"],
+                    "status": order["status"],
+                    "filled": float(order.get("filled", 0.0)),
+                    "remaining": float(order.get("remaining", 0.0)),
+                    "clientOrderId": order.get("clientOrderId") or order.get("info", {}).get("clOrdId"),
+                }
+                for order in all_orders
+            ]
+        except Exception as e:
+            self.logger.error(f"Error fetching open orders: {e}")
+            return []
 
     def fetch_ohlcv(
         self,

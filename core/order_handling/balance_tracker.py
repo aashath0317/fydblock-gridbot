@@ -1,7 +1,7 @@
 import logging
 
 from config.trading_mode import TradingMode
-from core.bot_management.event_bus import EventBus, Events
+from core.bot_management.event_bus import EventBus
 from core.services.exchange_interface import ExchangeInterface
 
 from ..validation.exceptions import (
@@ -43,8 +43,10 @@ class BalanceTracker:
         self.total_fees: float = 0
         self.reserved_fiat: float = 0.0
         self.reserved_crypto: float = 0.0
+        self.investment_cap: float = float("inf")
 
-        self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
+        # REMOVED: Automatic subscription. OrderManager will call update manually to ensure sequence.
+        # self.event_bus.subscribe(Events.ORDER_FILLED, self._update_balance_on_order_completion)
 
     async def setup_balances(
         self,
@@ -53,21 +55,15 @@ class BalanceTracker:
         exchange_service=ExchangeInterface,
     ):
         """
-        Sets up the balances based on trading mode.
-
-        For BACKTEST mode, sets initial balances.
-        For LIVE and PAPER_TRADING modes, fetches balances dynamically from the exchange.
-
-        Args:
-            initial_balance: The initial fiat balance for backtest mode.
-            initial_crypto_balance: The initial crypto balance for backtest mode.
-            exchange_service: The exchange instance (required for live and paper_trading trading).
+        Sets up the balances using the investment cap passed from the Strategy.
         """
-        if self.trading_mode == TradingMode.BACKTEST:
-            self.balance = initial_balance
-            self.crypto_balance = initial_crypto_balance
-        elif self.trading_mode == TradingMode.LIVE or self.trading_mode == TradingMode.PAPER_TRADING:
-            self.balance, self.crypto_balance = await self._fetch_live_balances(exchange_service)
+        self.balance = initial_balance
+        self.crypto_balance = initial_crypto_balance
+        self.investment_cap = initial_balance
+
+        self.logger.info(
+            f"Balance Tracker Initialized: {self.balance} {self.quote_currency} (Investment Cap) / {self.crypto_balance} {self.base_currency}"
+        )
 
     async def _fetch_live_balances(
         self,
@@ -95,7 +91,46 @@ class BalanceTracker:
         )
         return quote_balance, base_balance
 
-    async def _update_balance_on_order_completion(self, order: Order) -> None:
+    async def sync_balances(self, exchange_service: ExchangeInterface, current_price: float):
+        """
+        Forces an update of the available (free) balance from the exchange.
+        This ensures the bot doesn't try to spend funds it doesn't actually have.
+        """
+        try:
+            balances = await exchange_service.get_balance()
+            if balances and "free" in balances and "total" in balances:
+                # Update Available Fiat
+                free_fiat = float(balances["free"].get(self.quote_currency, 0.0))
+                free_crypto = float(balances["free"].get(self.base_currency, 0.0))
+
+                total_fiat = float(balances["total"].get(self.quote_currency, 0.0))
+                total_crypto = float(balances["total"].get(self.base_currency, 0.0))
+
+                crypto_equity_value = total_crypto * current_price
+
+                locked_fiat = total_fiat - free_fiat
+                target_total_fiat = max(0.0, self.investment_cap - crypto_equity_value)
+
+                max_allowed_free_fiat = max(0.0, target_total_fiat - locked_fiat)
+
+                new_fiat = min(free_fiat, max_allowed_free_fiat)
+                new_crypto = free_crypto
+
+                # Log only if there's a significant drift
+                if abs(new_fiat - self.balance) > 1.0 or abs(new_crypto - self.crypto_balance) > 0.01:
+                    self.logger.info(
+                        f"⚖️ Balance Synced: {self.balance:.2f} -> {new_fiat:.2f} {self.quote_currency} "
+                        f"(Wallet Free: {free_fiat:.2f}, Total Crypto Val: {crypto_equity_value:.2f}) | "
+                        f"{self.crypto_balance:.4f} -> {new_crypto:.4f} {self.base_currency}"
+                    )
+
+                self.balance = new_fiat
+                self.crypto_balance = new_crypto
+        except Exception as e:
+            self.logger.error(f"Failed to sync balances: {e}")
+
+    # CHANGED: Renamed from _update_balance_on_order_completion to public method
+    async def update_balance_on_order_completion(self, order: Order) -> None:
         """
         Updates the account balance and crypto balance when an order is filled.
 
@@ -200,7 +235,7 @@ class BalanceTracker:
             amount: The amount of fiat to reserve.
         """
         if self.balance < amount:
-            raise InsufficientBalanceError(f"Insufficient fiat balance to reserve {amount}.")
+            raise InsufficientBalanceError(f"Insufficient fiat balance to reserve {amount}. Available: {self.balance}")
 
         self.reserved_fiat += amount
         self.balance -= amount
@@ -217,7 +252,9 @@ class BalanceTracker:
             quantity: The quantity of crypto to reserve.
         """
         if self.crypto_balance < quantity:
-            raise InsufficientCryptoBalanceError(f"Insufficient crypto balance to reserve {quantity}.")
+            raise InsufficientCryptoBalanceError(
+                f"Insufficient crypto balance to reserve {quantity}. Available: {self.crypto_balance}"
+            )
 
         self.reserved_crypto += quantity
         self.crypto_balance -= quantity

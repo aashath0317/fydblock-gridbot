@@ -1,43 +1,45 @@
-# Byte-compiled / optimized / DLL files
-*.DS_Store
+# --- Python Essentials ---
 __pycache__/
 *.pyc
 *.py[cod]
+# IMPORTANT: This matches your folder name
+venv/
+env/
+.venv/
 
-# Distribution / packaging
+# --- System & Logs ---
+*.DS_Store
+pip-log.txt
+logs/*
+*.prof
+
+# --- Distribution ---
 build/
 dist/
 *.egg-info/
-*.lock
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# --- Dependencies Lock Files ---
+# CAUTION: Usually you WANT to commit lock files (like uv.lock or poetry.lock)
+# to make sure the server installs the exact same versions. 
+# Uncomment the line below only if you really want to ignore them.
+# *.lock
 
-# Unit test / coverage reports
-.tox/
-.coverage
-.cache
-coverage.xml
-
-# Ignore profiling output files
-*.prof
-
-# VS Code
+# --- VS Code ---
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
 
-# Secrets
+# --- Secrets (Safety First!) ---
 secrets.json
 .env.yml
 .env
+
+# --- Project Specific ---
 loki-data/
 grafana-data/
-
-# `uv` Package Manager
-.uv/
-
-# Project specific
 /data/
-logs/*
+.uv/
+.tox/
+.coverage
+.cache
+coverage.xml

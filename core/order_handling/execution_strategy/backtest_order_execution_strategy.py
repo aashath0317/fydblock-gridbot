@@ -9,20 +9,20 @@ class BacktestOrderExecutionStrategy(OrderExecutionStrategyInterface):
         self,
         order_side: OrderSide,
         pair: str,
-        quantity: float,
+        amount: float,
         price: float,
     ) -> Order | None:
         order_id = f"backtest-{int(time.time())}"
         timestamp = int(time.time() * 1000)
         return Order(
             identifier=order_id,
-            status=OrderStatus.OPEN,
+            status=OrderStatus.CLOSED,
             order_type=OrderType.MARKET,
             side=order_side,
             price=price,
             average=price,
-            amount=quantity,
-            filled=quantity,
+            amount=amount,
+            filled=amount,
             remaining=0,
             timestamp=timestamp,
             datetime="111",
@@ -77,3 +77,10 @@ class BacktestOrderExecutionStrategy(OrderExecutionStrategyInterface):
             symbol=pair,
             time_in_force="GTC",
         )
+
+    async def cancel_order(
+        self,
+        order_id: str,
+        pair: str,
+    ) -> bool:
+        return True
