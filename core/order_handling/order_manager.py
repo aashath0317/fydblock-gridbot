@@ -404,8 +404,9 @@ class OrderManager:
         has_fiat = self.balance_tracker.balance > MIN_FIAT_THRESHOLD
         has_crypto = self.balance_tracker.crypto_balance > MIN_CRYPTO_THRESHOLD
 
-        safe_buy_limit = current_price * 0.998
-        safe_sell_limit = current_price * 1.002
+        # WIDENED GAP: 0.5% buffer each side to strictly prevent "near current price" orders
+        safe_buy_limit = current_price * 0.995
+        safe_sell_limit = current_price * 1.005
 
         # Check BUY Grids
         if has_fiat:

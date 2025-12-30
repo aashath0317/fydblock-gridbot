@@ -40,7 +40,11 @@ class GridManager:
             self.grid_levels = {
                 price: GridLevel(
                     price,
-                    GridCycleState.READY_TO_BUY if price <= self.central_price else GridCycleState.READY_TO_SELL,
+                    # FIX: Center Grid Logic
+                    # If price is at or above central price, we treat it as "Already Bought" (Initial Position).
+                    # So its state is READY_TO_SELL.
+                    # Only prices strictly BELOW central are READY_TO_BUY.
+                    GridCycleState.READY_TO_BUY if price < self.central_price else GridCycleState.READY_TO_SELL,
                 )
                 for price in self.price_grids
             }
@@ -304,10 +308,11 @@ class GridManager:
         self.logger.info(f"   ?? Lower Band: {bottom_range}")
         self.logger.info(f"   ?? Upper Band: {top_range}")
 
-        # --- N+1 GRID LOGIC REMOVED ---
-        # User requested to "Don't add +1 initial order".
-        # We revert to using num_grids exactly.
-        points_to_generate = num_grids
+        # --- N+1 GRID LOGIC RESTORED ---
+        # User goal: 30 Grids setting => 30 Pending Orders + 1 Active Position.
+        # Total lines needed = 31.
+        # So we MUST generate N+1 points.
+        points_to_generate = num_grids + 1
 
         if spacing_type == SpacingType.ARITHMETIC:
             grids = np.linspace(bottom_range, top_range, points_to_generate)
