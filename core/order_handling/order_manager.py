@@ -424,6 +424,20 @@ class OrderManager:
                 if is_active:
                     continue
 
+                # --- FIX: Check for Dust/Insufficient Funds ---
+                total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
+                raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+                required_value = raw_quantity * price
+
+                # 5% tolerance to avoid skipping due to tiny fee mismatches, but prevent massive partial "dust" fills
+                if self.balance_tracker.balance < (required_value * 0.95):
+                    self.logger.warning(
+                        f"Skipping BUY reconciliation for level {price}: Insufficient funds "
+                        f"(Available: {self.balance_tracker.balance:.2f}, Required: {required_value:.2f})"
+                    )
+                    continue
+                # ----------------------------------------------
+
                 success = await self._place_limit_order_safe(price, OrderSide.BUY)
                 if not success:
                     break
@@ -444,6 +458,21 @@ class OrderManager:
                 )
                 if is_active:
                     continue
+
+                # --- FIX: Check for Dust/Insufficient Funds ---
+                total_balance_value = self.balance_tracker.get_total_balance_value(current_price)
+                raw_quantity = self.grid_manager.get_order_size_for_grid_level(total_balance_value, price)
+
+                # For SELL, the "value" needed is the crypto amount itself
+                required_crypto = raw_quantity
+
+                if self.balance_tracker.crypto_balance < (required_crypto * 0.95):
+                    self.logger.warning(
+                        f"Skipping SELL reconciliation for level {price}: Insufficient crypto "
+                        f"(Available: {self.balance_tracker.crypto_balance:.4f}, Required: {required_crypto:.4f})"
+                    )
+                    continue
+                # ----------------------------------------------
 
                 success = await self._place_limit_order_safe(price, OrderSide.SELL)
                 if not success:
