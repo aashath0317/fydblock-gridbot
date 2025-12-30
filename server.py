@@ -11,9 +11,10 @@ from config.config_validator import ConfigValidator
 from core.bot_management.event_bus import EventBus
 from core.storage.bot_database import BotDatabase
 
-# --- Import Core Modules ---
 from core.bot_management.grid_trading_bot import GridTradingBot
 from core.bot_management.notification.notification_handler import NotificationHandler
+from core.services.exchange_service_factory import ExchangeServiceFactory
+from core.order_handling.order import OrderSide
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -281,8 +282,16 @@ async def start_bot(req: BotRequest):
 
 @app.post("/stop/{bot_id}")
 async def stop_bot(bot_id: int):
+    # Idempotency Check: If bot is not active, check if it exists in DB
     if bot_id not in active_instances:
-        raise HTTPException(status_code=404, detail="Bot not found")
+        status = db.get_bot_status(bot_id)
+        if status in ["STOPPED", "CRASHED", "DELETED"]:
+            return {"status": "already_stopped", "message": f"Bot {bot_id} is already {status}"}
+
+        # If DB says RUNNING but not in memory -> Zombie state
+        # We force update to STOPPED to match reality
+        db.update_bot_status(bot_id, "STOPPED")
+        return {"status": "stopped", "message": "Bot was zombie (DB=RUNNING, Memory=None). Forced STOPPED."}
 
     instance = active_instances[bot_id]
     bot = instance["bot"]
@@ -290,11 +299,8 @@ async def stop_bot(bot_id: int):
     # 1. Update Status to STOPPING (Lock)
     db.update_bot_status(bot_id, "STOPPING")
 
-    # 2. Trigger Strict Stop
-    await bot._stop(sell_assets=False)  # Note: User might WANT to sell assets.
-    # Current API doesn't specify. SRS says "Strict Safety Protocol ... Guarantee clean exit with no lingering orders."
-    # It does NOT explicitly say "Liquidate". It says "Cancel Open Orders".
-    # So sell_assets=False is correct for "Stop", unless "Panic Sell" requested.
+    # 2. Trigger Strict Stop (No Liquidation by default on Stop)
+    await bot._stop(sell_assets=False)
 
     try:
         await asyncio.wait_for(instance["task"], timeout=5.0)
@@ -308,6 +314,124 @@ async def stop_bot(bot_id: int):
 
     del active_instances[bot_id]
     return {"status": "stopped"}
+
+
+class DeleteBotRequest(BaseModel):
+    api_key: str | None = None
+    api_secret: str | None = None
+    passphrase: str | None = None
+    exchange: str | None = None
+    pair: str | None = None
+    mode: str = "live"
+
+
+from config.trading_mode import TradingMode
+
+
+@app.delete("/bot/{bot_id}")
+async def delete_bot(bot_id: int, liquidate: bool = True, creds: DeleteBotRequest | None = None):
+    """
+    Deletes a bot.
+    - If active: Stops it.
+      - If liquidate=True (default), sells all assets first.
+    - If inactive:
+        - Requires 'creds' (DeleteBotRequest) body to liquidate assets.
+        - Otherwise just marks DELETED.
+    """
+    logger.info(f"DELETE /bot/{bot_id}: Liquidate={liquidate}, Creds={creds}")
+
+    if bot_id in active_instances:
+        # Active Bot: Can Liquidate
+        instance = active_instances[bot_id]
+        bot = instance["bot"]
+
+        db.update_bot_status(bot_id, "STOPPING")
+
+        logger.info(f"🗑️ Deleting Bot {bot_id} (Active, Liquidate={liquidate})...")
+        await bot._stop(sell_assets=liquidate)
+
+        try:
+            await asyncio.wait_for(instance["task"], timeout=10.0)
+        except Exception as e:
+            logger.error(f"Error stopping/liquidating bot {bot_id}: {e}")
+
+        del active_instances[bot_id]
+        db.update_bot_status(bot_id, "DELETED")
+
+        return {"status": "deleted", "liquidation_attempted": liquidate}
+
+    else:
+        # Inactive Bot
+        status = db.get_bot_status(bot_id)
+        if status == "DELETED":
+            return {"status": "already_deleted"}
+
+        db.update_bot_status(bot_id, "DELETED")
+
+        liq_msg = "Skipped (No Creds)"
+
+        # --- OFFLINE LIQUIDATION ---
+        if liquidate and creds and creds.api_key and creds.exchange and creds.pair:
+            try:
+                logger.info(f"🔄 Offline Liquidation for Bot {bot_id}...")
+
+                # 1. Create Minimal Exchange Service
+                exchange_config = {
+                    "exchange": {"name": creds.exchange, "trading_mode": creds.mode},
+                    "credentials": {
+                        "api_key": creds.api_key,
+                        "api_secret": creds.api_secret,
+                        "password": creds.passphrase,
+                    },
+                }
+
+                class MockConfig:
+                    def get_exchange_config(self):
+                        return exchange_config["exchange"]
+
+                    def get_credentials(self):
+                        return exchange_config["credentials"]
+
+                    # --- Attributes required by LiveExchangeService ---
+                    def get_exchange_name(self):
+                        return exchange_config["exchange"]["name"]
+
+                    def get_api_key(self):
+                        return exchange_config["credentials"]["api_key"]
+
+                    def get_api_secret(self):
+                        return exchange_config["credentials"]["api_secret"]
+
+                    def get_api_password(self):
+                        return exchange_config["credentials"]["password"]
+
+                mode_enum = TradingMode.PAPER_TRADING if creds.mode == "paper" else TradingMode.LIVE
+                service = ExchangeServiceFactory.create_exchange_service(MockConfig(), mode_enum)
+
+                # 2. Get Balance
+                # service.initialize() is not needed/does not exist (done in __init__)
+                base, quote = creds.pair.split("/")
+                balances = await service.get_balance()
+                crypto_amount = balances.get(base, {}).get("free", 0.0)
+
+                # 3. Sell if Amount > threshold
+                if crypto_amount > 0.001:
+                    logger.info(f"Selling {crypto_amount} {base} (Offline)...")
+                    # place_order(pair, order_type, order_side, amount, price=None)
+                    await service.place_order(creds.pair, "market", "sell", crypto_amount)
+                    logger.info("✅ Offline Liquidation Successful.")
+                    liq_msg = "Success"
+                else:
+                    logger.info(f"ℹ️ Offline Liquidation: No assets to sell ({crypto_amount} {base}).")
+                    liq_msg = "No Assets"
+
+                await service.close_connection()
+
+            except Exception as e:
+                logger.error(f"Offline Liquidation Failed: {e}", exc_info=True)
+                liq_msg = f"Failed: {str(e)}"
+
+        return {"status": "deleted", "message": "Bot marked DELETED.", "offline_liquidation": liq_msg}
 
 
 @app.get("/health/system")
