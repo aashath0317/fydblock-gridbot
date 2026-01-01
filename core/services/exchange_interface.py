@@ -67,3 +67,16 @@ class ExchangeInterface(ABC):
     async def fetch_open_orders(self, pair: str) -> list[dict]:
         """Fetches all currently open orders for the pair."""
         pass
+
+    @abstractmethod
+    async def start_user_stream(
+        self,
+        on_order_update: Any,
+    ) -> None:
+        """
+        Starts a WebSocket stream for user data (orders).
+
+        Args:
+            on_order_update: Callback function to invoke when an order update is received.
+        """
+        pass

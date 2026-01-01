@@ -38,19 +38,49 @@ class OrderStatusTracker:
 
     async def _track_open_order_statuses(self) -> None:
         """
-        Periodically checks the statuses of open orders and updates their states.
+        DEPRECATED: Polling loop.
+        Kept for fallback if needed, but start_streaming matches the plan.
+        We will remove the actual loop logic to prevent usage.
+        """
+        self.logger.warning("_track_open_order_statuses called but polling is disabled.")
+        return
+
+    async def start_streaming(self) -> None:
+        """
+        Starts the WebSocket stream for order updates.
+        """
+        if self._monitoring_task and not self._monitoring_task.done():
+            self.logger.warning("OrderStatusTracker stream is already running.")
+            return
+
+        # Start the integrity/reconciliation once before streaming
+        await self._process_open_orders()
+
+        self._monitoring_task = asyncio.create_task(
+            self.order_execution_strategy.exchange_service.start_user_stream(self._on_order_update)
+        )
+        self.logger.info("OrderStatusTracker has started WebSocket stream.")
+
+    async def _on_order_update(self, order_data: dict) -> None:
+        """
+        Callback for WebSocket order updates.
         """
         try:
-            while True:
-                await self._process_open_orders()
-                await asyncio.sleep(self.polling_interval)
+            # order_data is a dict consistent with ccxt structure
+            # We construct a partial Order object or just handle the ID and status directly.
+            # Assuming order_data has 'id', 'status', 'filled', 'remaining'
 
-        except asyncio.CancelledError:
-            self.logger.info("OrderStatusTracker monitoring task was cancelled.")
-            await self._cancel_active_tasks()
+            order_id = order_data.get("id")
+            status = order_data.get("status")
 
-        except Exception as error:
-            self.logger.error(f"Unexpected error in OrderStatusTracker: {error}")
+            if not order_id or not status:
+                self.logger.warning(f"Incomplete order data received: {order_data}")
+                return
+
+            self._handle_order_status_change(order_data)
+
+        except Exception as e:
+            self.logger.error(f"Error handling WebSocket order update: {e}", exc_info=True)
 
     async def _process_open_orders(self) -> None:
         """
@@ -80,41 +110,78 @@ class OrderStatusTracker:
 
     def _handle_order_status_change(
         self,
-        remote_order: Order,
+        order_data: dict | Order,
     ) -> None:
         """
-        Handles changes in the status of the order data fetched from the exchange.
+        Handles changes in the status of the order data (from WebSocket or Polling).
 
         Args:
-            remote_order: The latest `Order` object fetched from the exchange.
-
-        Raises:
-            ValueError: If critical fields (e.g., status) are missing from the remote order.
+            order_data: Dictionary containing order details OR Order object.
         """
         try:
-            if remote_order.status == OrderStatus.UNKNOWN:
-                self.logger.error(f"Missing 'status' in remote order object: {remote_order}", exc_info=True)
-                raise ValueError("Order data from the exchange is missing the 'status' field.")
-            elif remote_order.status == OrderStatus.CLOSED:
-                self.order_book.update_order_status(remote_order.identifier, OrderStatus.CLOSED)
-                self.event_bus.publish_sync(Events.ORDER_FILLED, remote_order)
-                self.logger.info(f"Order {remote_order.identifier} filled.")
-            elif remote_order.status == OrderStatus.CANCELED:
-                self.order_book.update_order_status(remote_order.identifier, OrderStatus.CANCELED)
-                self.event_bus.publish_sync(Events.ORDER_CANCELLED, remote_order)
-                self.logger.warning(f"Order {remote_order.identifier} was canceled.")
-            elif remote_order.status == OrderStatus.OPEN:  # Still open
-                if remote_order.filled > 0:
+            if isinstance(order_data, dict):
+                order_id = order_data.get("id")
+                status = order_data.get("status")
+                filled = float(order_data.get("filled", 0.0))
+                remaining = float(order_data.get("remaining", 0.0))
+            else:
+                # Assume Order object
+                order_id = order_data.identifier
+                status = order_data.status
+                filled = order_data.filled
+                remaining = order_data.remaining
+
+            if not status:
+                self.logger.error(f"Missing 'status' in order data: {order_data}")
+                return  # Can't raise here as it might break the loop, just return
+
+            # Normalize status to enum if possible or string check
+            if status == OrderStatus.CLOSED or status == "closed":
+                self.order_book.update_order_status(order_id, OrderStatus.CLOSED)
+                # Ideally we want an Order object, but for now we might need to fetch it or construct it
+                # If we have it in order_book, we can get it
+                local_order = self.order_book.get_order(order_id)
+                if local_order:
+                    # Update local order with filled amount
+                    local_order.filled = filled
+                    local_order.remaining = remaining
+                    local_order.status = OrderStatus.CLOSED
+
+                    # FIX: Update price information if available
+                    avg_price = (
+                        float(order_data.get("average", 0.0)) if isinstance(order_data, dict) else order_data.average
+                    )
+                    ord_price = (
+                        float(order_data.get("price", 0.0)) if isinstance(order_data, dict) else order_data.price
+                    )
+
+                    if avg_price and avg_price > 0:
+                        local_order.average = avg_price
+                    if ord_price and ord_price > 0:
+                        local_order.price = ord_price
+
+                    self.event_bus.publish_sync(Events.ORDER_FILLED, local_order)
+                    self.logger.info(f"Order {order_id} filled.")
+                else:
+                    self.logger.warning(f"Filled order {order_id} not found in local OrderBook.")
+
+            elif status == OrderStatus.CANCELED or status == "canceled":
+                self.order_book.update_order_status(order_id, OrderStatus.CANCELED)
+                local_order = self.order_book.get_order(order_id)
+                if local_order:
+                    self.event_bus.publish_sync(Events.ORDER_CANCELLED, local_order)
+                self.logger.warning(f"Order {order_id} was canceled.")
+
+            elif status == OrderStatus.OPEN or status == "open":  # Still open
+                if filled > 0:
                     self.logger.info(
-                        f"Order {remote_order} partially filled. Filled: {remote_order.filled}, "
-                        f"Remaining: {remote_order.remaining}.",
+                        f"Order {order_id} partially filled. Filled: {filled}, Remaining: {remaining}.",
                     )
                 else:
-                    # CHANGED: Switched to debug to reduce log spam
-                    self.logger.debug(f"Order {remote_order} is still open. No fills yet.")
+                    self.logger.debug(f"Order {order_id} is still open. No fills yet.")
             else:
                 self.logger.warning(
-                    f"Unhandled order status '{remote_order.status}' for order {remote_order.identifier}.",
+                    f"Unhandled order status '{status}' for order {order_id}.",
                 )
 
         except Exception as e:
@@ -140,6 +207,10 @@ class OrderStatusTracker:
             task.cancel()
         await asyncio.gather(*self._active_tasks, return_exceptions=True)
         self._active_tasks.clear()
+
+    # NOTE: start_tracking is deprecated/removed in favor of start_streaming
+    # but kept as alias if needed, or we just remove it.
+    # The plan said "Remove polling loop", so we replacing start_tracking logic.
 
     def start_tracking(self) -> None:
         """

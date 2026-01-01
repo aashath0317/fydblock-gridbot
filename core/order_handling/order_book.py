@@ -59,3 +59,12 @@ class OrderBook:
             if order.identifier == order_id:
                 order.status = new_status
                 break
+
+    def get_order(self, order_id: str) -> Order | None:
+        """
+        Retrieves an order by its identifier.
+        """
+        for order in self.buy_orders + self.sell_orders + self.non_grid_orders:
+            if order.identifier == order_id:
+                return order
+        return None

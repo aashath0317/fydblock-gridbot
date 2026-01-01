@@ -140,6 +140,78 @@ class LiveExchangeService(ExchangeInterface):
     ) -> None:
         await self._subscribe_to_ticker_updates(pair, on_price_update, update_interval)
 
+    async def start_user_stream(
+        self,
+        on_order_update: Callable[[dict], None],
+    ) -> None:
+        """
+        Connects to the private user data stream (orders) via WebSocket.
+        Uses ccxt.pro's watch_orders().
+        """
+        self.connection_active = True
+        self.logger.info(f"Starting user data stream for {self.exchange_name}...")
+        retry_count = 0
+        max_retries = 10
+
+        while self.connection_active:
+            try:
+                # Watch for ANY order updates (symbol=None means all symbols, or catch-all)
+                # Note: Some exchanges require a symbol. For a single-pair bot, we can pass it if needed.
+                # However, watch_orders() usually returns a list of orders.
+                orders = await self.exchange.watch_orders()
+
+                if not self.connection_active:
+                    break
+
+                # orders is a list of order objects. We process each.
+                for order in orders:
+                    # Clean/normalize data if needed, but ccxt unified structure is good.
+                    # We pass the raw ccxt order object (dict) to the callback.
+                    try:
+                        normalized_order = {
+                            "id": order["id"],
+                            "price": float(order["price"]) if order["price"] else 0.0,
+                            "average": float(order["average"]) if order.get("average") else 0.0,
+                            "amount": float(order["amount"]) if order["amount"] else 0.0,
+                            "side": order["side"],
+                            "status": order["status"],
+                            "filled": float(order.get("filled", 0.0)),
+                            "remaining": float(order.get("remaining", 0.0)),
+                            "clientOrderId": order.get("clientOrderId") or order.get("info", {}).get("clOrdId"),
+                            "raw": order,  # Keep raw just in case
+                        }
+                        # Invoke callback
+                        if asyncio.iscoroutinefunction(on_order_update):
+                            await on_order_update(normalized_order)
+                        else:
+                            on_order_update(normalized_order)
+
+                    except Exception as e:
+                        self.logger.error(f"Error processing order update: {e}", exc_info=True)
+
+                retry_count = 0  # Reset on success
+
+            except (NetworkError, ExchangeError) as e:
+                retry_count += 1
+                retry_interval = min(retry_count * 5, 60)
+                self.logger.error(
+                    f"Error in user stream: {e}. Retrying in {retry_interval}s ({retry_count}/{max_retries})."
+                )
+                if retry_count >= max_retries:
+                    self.logger.error("Max retries reached for user stream. Stopping.")
+                    self.connection_active = False
+                    break
+                await asyncio.sleep(retry_interval)
+
+            except asyncio.CancelledError:
+                self.logger.info("User stream task cancelled.")
+                self.connection_active = False
+                break
+
+            except Exception as e:
+                self.logger.error(f"Unexpected error in user stream: {e}", exc_info=True)
+                await asyncio.sleep(5)
+
     async def close_connection(self) -> None:
         self.connection_active = False
         self.logger.info("Closing WebSocket connection...")

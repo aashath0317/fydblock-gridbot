@@ -144,7 +144,7 @@ class GridTradingBot:
                 exchange_service=self.exchange_service,
             )
 
-            self.order_status_tracker.start_tracking()
+            await self.order_status_tracker.start_streaming()
             self.strategy.initialize_strategy()
 
             # --- FIX: Store the task in self.integrity_task ---
@@ -219,7 +219,7 @@ class GridTradingBot:
         self.is_running = True
 
         try:
-            self.order_status_tracker.start_tracking()
+            await self.order_status_tracker.start_streaming()
             await self.strategy.restart()
 
             # Restart integrity check if needed
